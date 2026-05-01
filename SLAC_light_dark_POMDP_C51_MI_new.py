@@ -1,0 +1,2148 @@
+import os
+from dataclasses import dataclass
+import tyro
+import copy
+import numpy as np
+import pickle  as pkl
+import time
+from pathlib import Path
+import random
+from tempfile import NamedTemporaryFile
+
+import torch
+from torch.distributions import MultivariateNormal, Normal, Independent, Bernoulli, kl_divergence
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+
+from gymnasium import Env, Wrapper
+from gymnasium.spaces import Discrete
+
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import cv2
+import imageio.v2 as imageio
+import wandb
+
+from SLAC_Agent_deterministic_tabular import ModelDistributionNetwork, MLPDecoder
+from SLAC_Agent_D3QN_tabular import D3QNAgent
+from SequenceReplayBuffer import SequenceReplayBuffer
+#from envs.light_dark_navigation_env import make_env
+from envs.Light_dark_POMDP_flags import make_env
+
+@dataclass
+class Args:
+    torch_deterministic: bool = False
+    """if toggled, `torch.backends.cudnn.deterministic=False`"""
+    cuda: bool = True
+    """if toggled, cuda will be enabled by default"""
+    save_model: bool = True
+    """if toggled, the trained model will be saved to disk"""
+    from_scratch: bool = True
+    """if toggled, the model will be trained from scratch"""
+    ckpt_path = "checkpoints//lightDarkNavigation_POMDP//pretrained_model_fixedtarget_nocue.pth"
+    """If not from scratch, path to the pretrained model"""
+
+    env_id: str = "LightDarkNavigation-v0"
+    """the id of the environment"""
+    sigma_dark = 0.0
+    """the standard deviation of the dark region noise"""
+    sigma_light = 0.0
+    """the standard deviation of the light region noise"""
+
+    # Algorithm specific arguments
+    total_timesteps: int = 500_000
+    """total timesteps of the experiments"""
+    max_episode_steps: int = 200
+    """max timesteps per episode"""
+    pretrain_steps: int = 100_000
+    """number of pretraining steps for the world model"""
+    seed : int = 42
+    """random seed of the experiment"""
+    num_envs: int = 1
+    """number of parallel environments"""
+    q_learning_rate: float = 5e-4
+    """the learning rate of the q_network optimizer"""
+    m_learning_rate: float = 1e-4
+    """the learning rate of the model_network optimizer"""
+    alpha_lr: float = 3e-4
+    """the learning rate of the alpha optimizer"""
+    start_e: float = 1.0
+    """the starting epsilon for exploration"""
+    end_e: float = 0.01
+    """the ending epsilon for exploration"""
+    exploration_fraction: float = 0.2
+    """the fraction of `total-timesteps` it takes from start-e to go end-e"""
+    gamma: float = 0.99
+    """the discount factor"""
+    learning_starts: int = 10_000
+    """timestep to start learning"""
+    train_frequency: int = 4
+    """the frequency of training"""
+    target_network_frequency: int = 1000
+    """the frequency of target network update"""
+    world_model_update_frequency: int = 32
+    """the frequency of world model update (in gradient steps, not env steps)"""
+    tau: float = 0.005
+    """the polyak averaging factor for target network update"""
+    sequence_len : int = 8
+    """the length of the sequence for training"""
+    buffer_size: int = 100_000
+    """the replay memory buffer size"""
+    kl_analytic: bool = True
+    """if toggled, the KL divergence will be computed analytically"""
+    batch_size: int = 128
+    """the batch size of sample from the reply memory"""
+    base_depth: int = 32
+    """the base depth of the model network"""
+    latent1_size: int = 32
+    """the size of the first latent variable"""
+    latent2_size: int = 256
+    """the size of the second latent variable"""
+    hidden_dims: tuple = (256, 256)
+    """the hidden dimensions of the Q-network"""
+
+    # ========= C51 (distributional critic) =========
+    N_atoms: int = 51
+    """Number of atoms for the categorical return distribution (C51)."""
+    Q_min: float = -1.0
+    """Minimum value of the support for C51."""
+    Q_max: float = 1.0
+    """Maximum value of the support for C51."""
+
+    # ========= Mutual-information intrinsic bonus =========
+    mi_use: bool = True
+    """If toggled, adds MI-based intrinsic reward."""
+    mi_num_samples: int = 4
+    """Posterior samples per timestep for MI estimation."""
+    #mi_beta: float = 0.5
+    #"""Weight of MI bonus added to env reward: r_total_{t+1}=r_env_{t+1}+mi_beta*MI_t."""
+    mi_target_ratio: float = 0.1
+    """Target ratio of MI bonus to env reward: E[mi_bonus] ≈ mi_target_ratio * E[r_env]. Used for automatic scaling."""
+    mi_norm_eps: float = 1e-8
+    """epsilon for MI normalization"""
+
+    mi_clip_value: float = 2.0
+    """clip value for normalized MI bonus"""
+
+    mi_center: bool = True
+    """whether to subtract batch mean from MI bonus before scaling"""
+
+    diag_use: bool = True
+    """Enable posterior / critic sensitivity diagnostics."""
+    diag_num_samples: int = 8
+    """Number of posterior samples K used for diagnostics."""
+    diag_every: int = 500
+    """Log diagnostics every this many global steps."""
+
+    intrinsic_mode: str = "posterior_reduction"
+    """one of: none, posterior_reduction, action_disagreement"""
+
+    intrinsic_beta: float = 0.1
+    """weight of intrinsic bonus"""
+
+    intrinsic_clip_value: float = 2.0
+    """clip value for centered intrinsic reward"""
+
+    intrinsic_num_samples: int = 8
+    """number of posterior samples for action-disagreement bonus"""
+
+    intrinsic_use_running_scale: bool = True
+    """auto-scale intrinsic reward relative to env reward"""
+
+    intrinsic_target_ratio: float = 0.1
+    """target |intrinsic| / |env reward| ratio when auto-scaling"""
+
+
+    # Logging
+    track: bool = True
+    """If toggled, logs metrics & videos to Weights & Biases."""
+    wandb_project_name: str = "light-dark-slac_POMDP_fixedtarget_nocue"
+    """W&B project name"""
+    wandb_entity: str | None = None
+    """W&B entity (team/user). None = default."""
+    disable_wandb_service: bool = True
+    """Windows stability: disable W&B service process (helps avoid WinError 10053)."""
+    video_fps: int = 15
+    """FPS for encoded evaluation videos."""
+    eval_every: int = 10_000
+    """How often to run evaluation (steps)."""
+    video_every: int = 20_000
+    """How often to log an evaluation video (steps)."""
+
+
+class DiscreteActionsEnv2(Wrapper):
+    """
+    Discretize a 2D Box acceleration action space for Env-2 (inertial dynamics).
+
+    Why not 9 actions {-a_max,0,+a_max}^2?
+      - With inertia + strict stop, you need *fine* braking.
+      - So we use multiple accel levels per axis (default 5 -> 25 actions).
+
+    Actions are accelerations a_t in [-a_max, a_max]^2.
+    """
+    def __init__(self, env, n_levels: int = 5, include_diag: bool = True):
+        super().__init__(env)
+        cfg = env.unwrapped.cfg
+
+        if not hasattr(cfg, "a_max"):
+            raise AttributeError("DiscreteActionsEnv2 expects env.unwrapped.cfg.a_max for Env-2.")
+
+        a_max = float(cfg.a_max)
+        assert a_max > 0, "cfg.a_max must be > 0"
+
+        # levels in [-a_max, a_max], include 0
+        # n_levels must be odd to include exact 0
+        if n_levels % 2 == 0:
+            n_levels += 1  # make it odd automatically
+
+        levels = np.linspace(-a_max, a_max, n_levels, dtype=np.float32)
+
+        grid = []
+        for ax in levels:
+            for ay in levels:
+                if not include_diag and (ax != 0.0 and ay != 0.0):
+                    continue
+                grid.append([ax, ay])
+
+        self._grid = np.asarray(grid, dtype=np.float32)
+        self.action_space = Discrete(len(self._grid))
+        self.observation_space = env.observation_space
+
+    def step(self, a_idx):
+        a = self._grid[int(a_idx)]
+        return self.env.step(a)
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+def _crop_to_mb(frames: np.ndarray, mb: int = 16) -> np.ndarray:
+    """Crop frames so H and W are divisible by macroblock size (default 16)."""
+    frames = np.asarray(frames, dtype=np.uint8)
+    if frames.ndim != 4:
+        return frames
+    t, h, w, c = frames.shape
+    h2 = h - (h % mb)
+    w2 = w - (w % mb)
+    if h2 <= 0 or w2 <= 0:
+        return frames
+    return frames[:, :h2, :w2, :]
+
+def encode_mp4_yuv420p(frames: np.ndarray, fps: int, out_path: str) -> str:
+    """
+    Encode frames to H.264 mp4 with yuv420p pixel format (browser compatible).
+    """
+    frames = _crop_to_mb(frames, mb=16)
+    writer = imageio.get_writer(
+        out_path,
+        fps=fps,
+        codec="libx264",
+        quality=8,
+        pixelformat="yuv420p",              # <-- avoids the "multiple -pix_fmt" warning
+        ffmpeg_params=["-movflags", "+faststart"],
+        macro_block_size=16,
+    )
+    for f in frames:
+        writer.append_data(f)
+    writer.close()
+    return out_path
+
+def log_video_to_wandb(frames: np.ndarray, fps: int, key: str, step: int, run):
+    """
+    Encode mp4 then log to W&B.
+    IMPORTANT: do NOT pass step=... to wandb when sync_tensorboard=True.
+              Instead we log 'global_step' and use define_metric.
+    """
+
+    frames = _crop_to_mb(frames, mb=16)
+
+    tmp = NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+
+    encode_mp4_yuv420p(frames, fps=fps, out_path=tmp_path)
+
+    # W&B ignores fps when you pass a file path; fps is already baked into the mp4.
+    run.log({key: wandb.Video(tmp_path, format="mp4"), "global_step": step})
+
+
+class Qagent():
+    """
+    Discrete-action soft-Q / DQN agent for SLAC latents.
+    - Input  : concat(z1, z2)  (size = latent1 + latent2)
+    - Output : Q-values for all actions
+    """
+
+    def __init__(self, n_actions, args):
+        self.state_size = args.latent1_size + args.latent2_size
+        self.hidden_dims = args.hidden_dims
+        self.n_actions = int(n_actions)
+        self.target_entropy = -0.98 * np.log(self.n_actions)
+        self.device = args.device
+        self.lr = args.q_learning_rate
+        self.alpha_lr = args.alpha_lr
+        self.epsilon = args.start_e
+        self.gamma = args.gamma
+        self.min_log_alpha = np.log(1e-4)
+
+        # 1. Q-network & target network
+        self.q_net        = self._build_mlp(self.state_size, self.n_actions, self.hidden_dims).to(self.device)
+        self.q_target_net = copy.deepcopy(self.q_net).eval().requires_grad_(False)
+
+        # ---------------- learnable log_alpha ------------
+        init_alpha = 0.5
+        self.log_alpha = torch.tensor(np.log(init_alpha),
+                                      requires_grad=True,
+                                      device=self.device)
+        
+        # ---------- optimizers -------------------------------------------
+        self.q_opt     = optim.Adam(self.q_net.parameters(), lr=self.lr)
+        self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=self.alpha_lr)
+    
+    @staticmethod
+    def _build_mlp(in_dim, out_dim, hidden_dims):
+        layers = []
+        last = in_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(last, h), nn.ReLU()]
+            last = h
+        layers.append(nn.Linear(last, out_dim))
+        return nn.Sequential(*layers)
+    
+    @torch.no_grad()
+    def act(self, z: torch.Tensor, epsilon: float | None = None) -> torch.Tensor:
+        """
+        ε-greedy over Q-values.
+        Returns action indices of shape (B, 1)
+        """
+        z = F.layer_norm(z, z.shape[-1:])
+        q = self.q_net(z)                                    # (B, A)
+        greedy = q.argmax(dim=1, keepdim=True)               # (B, 1)
+        return greedy
+
+    def compute_loss(self, z1, z2, actions, rewards, dones):
+        B, S, d1 = z1.shape
+        d = d1 + z2.size(-1)
+
+        z_all   = torch.cat([z1, z2], dim=-1)   # (B, S, d)
+        z_all = F.layer_norm(z_all, z_all.shape[-1:])
+        a_all   = actions.long()                # (B, S)
+        r_all   = rewards
+        done_all= dones.float()
+
+        # --- regular transitions: t = 0..S-2
+        z_t   = z_all[:, :-1]                   # (B, S-1, d)
+        z_tp1 = z_all[:,  1:]                   # (B, S-1, d)
+        a_t   = a_all[:, :-1]                   # (B, S-1)
+        r_tp1   = r_all[:, 1:]                   # (B, S-1)
+        d_tp1   = done_all[:, 1:]                # (B, S-1)
+
+        BT = B*(S-1)
+        z_t_f   = z_t.reshape(BT, d)
+        z_tp1_f = z_tp1.reshape(BT, d)
+        a_t_f   = a_t.reshape(BT)
+        r_tp1_f  = r_tp1.reshape(BT)
+        d_tp1_f  = d_tp1.reshape(BT)
+
+        with torch.no_grad():
+             # 1) online net chooses argmax action at s_{t+1}
+            q_online_tp1 = self.q_net(z_tp1_f)                      # (BT, A)
+            a_star     = q_online_tp1.argmax(dim=1, keepdim=True) # (BT,1)
+
+            # 2) target net evaluates that action
+            q_target_tp1 = self.q_target_net(z_tp1_f).gather(1, a_star).squeeze(-1)  # (BT,)
+
+            # terminal masking via (1 - done)
+            y_main = r_tp1_f + self.gamma * (1.0 - d_tp1_f) * q_target_tp1
+
+        # Q(s_t, a_t) prediction
+        q_main = self.q_net(z_t_f).gather(1, a_t_f.unsqueeze(-1)).squeeze(-1)  # (BT,)
+
+        # actions must be 0..A-1
+        assert a_t_f.min().item() >= 0 and a_t_f.max().item() < self.n_actions, \
+            f"Bad action indices in buffer: [{a_t_f.min().item()}, {a_t_f.max().item()}]"
+
+        # targets must be 1D and match BT
+        assert y_main.ndim == 1 and y_main.shape[0] == z_t_f.shape[0]
+        
+        q_loss = 0.5 * F.mse_loss(q_main, y_main, reduction="mean")
+
+        return q_loss, q_main
+    
+    def update(self, q_loss):
+        self.q_opt.zero_grad()
+        q_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
+        self.q_opt.step()
+    
+    def update_target_model(self):
+        self.q_target_net.load_state_dict(self.q_net.state_dict())
+    
+    @torch.no_grad()
+    def get_td_error(self, z1, z2, actions, rewards, dones):
+        B, S, d1 = z1.shape
+        d = d1 + z2.size(-1)
+
+        z_all   = torch.cat([z1, z2], dim=-1)   # (B, S, d)
+        z_all = F.layer_norm(z_all, z_all.shape[-1:])
+        a_all   = actions.long()                # (B, S)
+        r_all   = rewards
+        done_all= dones.float()
+
+        # --- regular transitions: t = 0..S-2
+        z_t   = z_all[:, :-1]                   # (B, S-1, d)
+        z_tp1 = z_all[:,  1:]                   # (B, S-1, d)
+        a_t   = a_all[:, :-1]                   # (B, S-1)
+        r_tp1   = r_all[:, 1:]                   # (B, S-1)
+        d_tp1   = done_all[:, 1:]                # (B, S-1)
+
+        BT = B*(S-1)
+        z_t_f   = z_t.reshape(BT, d)
+        z_tp1_f = z_tp1.reshape(BT, d)
+        a_t_f   = a_t.reshape(BT)
+        r_tp1_f  = r_tp1.reshape(BT)
+        d_tp1_f  = d_tp1.reshape(BT)
+
+            # 1) online net chooses argmax action at s_{t+1}
+        q_online_tp1 = self.q_net(z_tp1_f)                      # (BT, A)
+        a_star     = q_online_tp1.argmax(dim=1, keepdim=True) # (BT,1)
+
+        # 2) target net evaluates that action
+        q_target_tp1 = self.q_target_net(z_tp1_f).gather(1, a_star).squeeze(-1)  # (BT,)
+
+        # terminal masking via (1 - done)
+        y_main = r_tp1_f + self.gamma * (1.0 - d_tp1_f) * q_target_tp1
+
+        # Q(s_t, a_t) prediction
+        q_main = self.q_net(z_t_f).gather(1, a_t_f.unsqueeze(-1)).squeeze(-1)  # (BT,)
+
+        q_all_t = self.q_net(z_t_f)   # (BT, A)
+        td_err_taken = torch.zeros_like(y_main)
+        # This is the TD error for the action actually taken (what the loss uses)
+        td_err_taken = (q_all_t.gather(1, a_t_f.unsqueeze(-1)).squeeze(-1) - y_main)
+
+        mean_abs = []
+        for a in range(self.n_actions):
+            mask = (a_t_f == a)
+            if mask.any():
+                q_a  = q_all_t[mask, a]
+                y_a  = y_main[mask]          # IMPORTANT: target must be matched to the taken action only
+                td_a = (q_a - y_a).abs().mean().item()
+            else:
+                td_a = float('nan')
+            mean_abs.append(td_a)
+        return mean_abs
+    
+    def linear_schedule(self, start_e: float, end_e: float, duration: int, t: int):
+        slope = (end_e - start_e) / duration
+        return max(slope * t + start_e, end_e)
+    
+def save_world_model_ckpt(model, step, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ckpt = {
+        "step": step,
+        "model_state": model.state_dict(),
+    }
+    torch.save(ckpt, path)
+    print(f"[✓] Saved world model checkpoint at {path}")
+
+def load_from_newest_run(model, env_id, args, base_dir="checkpoints\\LightDarkNavigation",
+                         filename="model_pretrained_kl_teacher.pth"):
+    base = Path(base_dir)
+    run_dirs = [p for p in base.glob(f"{env_id}__*") if p.is_dir()]
+    if not run_dirs:
+        raise FileNotFoundError(f"No run directories found under {base} for env_id={env_id}")
+    latest_dir = max(run_dirs, key=lambda p: p.stat().st_mtime)
+    ckpt_path = latest_dir / filename
+    print(f"[✓] Loaded world model checkpoint from {ckpt_path}")
+    load_model_ckpt(model, args=args, ckpt_path=ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location=args.device)
+    
+    model.load_state_dict(ckpt["model_state"])
+    return ckpt.get("step"), ckpt_path
+
+def load_from_path(model,args):
+    load_model_ckpt(model, args=args, ckpt_path=args.ckpt_path)
+    ckpt = torch.load(args.ckpt_path, map_location=args.device)
+    model.load_state_dict(ckpt["model_state"])
+    return ckpt.get("step")
+
+    
+
+def load_model_ckpt(Model, args, ckpt_path):
+    ckpt = torch.load(ckpt_path, map_location=args.device)
+
+    if Model.obs_kind == "image":
+        # only image decoders have deconv1
+        latent_dim = args.latent1_size + args.latent2_size
+        if getattr(Model.decoder, "deconv1", None) is not None:
+            if Model.decoder.deconv1.weight.shape[0] != latent_dim:
+                Model.decoder.deconv1 = nn.ConvTranspose2d(
+                    latent_dim, 8*args.base_depth, kernel_size=4, stride=1, padding=0
+                ).to(args.device)
+    else:
+        # tabular path: make sure decoder exists (since it’s lazy normally)
+        if Model.decoder is None:
+            latent_dim = args.latent1_size + args.latent2_size
+            Model.decoder = MLPDecoder(
+                latent_dim, Model.tabular_dim, hidden=Model.decoder_mlp_hidden
+            ).to(args.device)
+
+    # finally load weights (strict=False in case ckpt has extra keys)
+    missing, unexpected = Model.load_state_dict(ckpt["model_state"], strict=False)
+    if missing or unexpected:
+        print("Missing keys:", missing)
+        print("Unexpected keys:", unexpected)
+
+
+class FreezeParams:
+    def __init__(self, params):
+        self.params = list(params)
+        self.prev = None
+    def __enter__(self):
+        self.prev = [p.requires_grad for p in self.params]
+        for p in self.params:
+            p.requires_grad_(False)
+    def __exit__(self, *exc):
+        for p, r in zip(self.params, self.prev):
+            p.requires_grad_(r)
+
+def huber(x, delta=1.0):
+    a = x.abs()
+    return torch.where(a < delta, 0.5 * a * a, delta * (a - 0.5 * delta))
+
+
+
+@torch.no_grad()
+def compute_mi_bonus(
+    agent,
+    q_z1,
+    q_z2,
+    actions,
+    step_types,
+    mi_num_samples: int,
+):
+    """
+    Approximate I(Z_t ; R | a_t) for the *taken actions*, using the existing
+    C51 critic.
+
+    Inputs:
+        q_z1, q_z2 : StackedNormal-like objects from Model.sample_posterior
+                     (have .dists which is an Independent(Normal(...),1))
+        actions    : (B, S) int64 tensors from replay buffer
+        step_types : (B, S) int64 tensors (unused except for shape; kept for clarity)
+        mi_num_samples: int, number of posterior samples for Monte-Carlo MI
+
+    Output:
+        mi_bonus : (B, S-1) tensor, MI per transition t (attached to r_{t+1})
+    """
+    device = agent.device
+    B, S = actions.shape
+    T = S - 1                   # number of transitions in each sequence
+
+    # Sample multiple latent trajectories from the *posterior* distributions
+    # q_z1, q_z2.  Shape: (K, B, S, d1/d2)
+    K = mi_num_samples
+    z1_samples = q_z1.dists.rsample((K,))    # (K, B, S, d1)
+    z2_samples = q_z2.dists.rsample((K,))    # (K, B, S, d2)
+
+    # We only need z_t (t=0..T-1) for transitions.
+    z1_t = z1_samples[:, :, :-1, :]          # (K, B, T, d1)
+    z2_t = z2_samples[:, :, :-1, :]          # (K, B, T, d2)
+    z_t  = torch.cat([z1_t, z2_t], dim=-1)   # (K, B, T, d)
+
+    # Actions at time t (aligned with z_t).
+    a_t = actions[:, :-1].to(device)         # (B, T)
+    B_, T_ = a_t.shape
+    assert B_ == B and T_ == T
+    BT = B * T
+
+    a_t_flat = a_t.reshape(-1)               # (BT,)
+    idx_bt   = torch.arange(BT, device=device)
+
+    probs_list = []
+
+    for k in range(K):
+        # z_t[k] : (B, T, d)
+        z_flat = z_t[k].reshape(BT, -1)                # (BT, d)
+        # same normalisation as in act()/compute_loss
+        z_flat = F.layer_norm(z_flat, z_flat.shape[-1:])
+
+        logits = agent._logits(z_flat)                 # (BT, A, N_atoms)
+        probs  = logits.softmax(dim=-1)                # (BT, A, N_atoms)
+        p_taken = probs[idx_bt, a_t_flat]              # (BT, N_atoms)
+        probs_list.append(p_taken)
+
+    # Stack probs over the posterior samples
+    # p_stack: (BT, K, N_atoms)
+    p_stack = torch.stack(probs_list, dim=1)
+    p_stack = p_stack.clamp(min=1e-8)
+
+    # Marginal distribution over returns (average across z)
+    # p_mean: (BT, N_atoms)
+    p_mean = p_stack.mean(dim=1)
+
+    def entropy(p):
+        # p: (..., N_atoms)
+        p = p.clamp(min=1e-8)
+        return -(p * p.log()).sum(dim=-1)
+
+    # H(R | a, "unknown z")  — entropy of the marginal
+    H_total = entropy(p_mean)                 # (BT,)
+
+    # H(R | a, z)  averaged over posterior samples
+    H_each  = entropy(p_stack)               # (BT, K)
+    H_cond  = H_each.mean(dim=-1)            # (BT,)
+
+    # I(Z;R | a) = H_total - H_cond
+    I_flat = (H_total - H_cond).clamp(min=0.0)   # (BT,)
+
+    # Reshape back to (B, T)  and return
+    mi_bonus = I_flat.view(B, T)
+    return mi_bonus
+
+def compute_loss(model, images, actions, step_types, step=None, rewards=None, discounts=None, latent_posterior_samples_and_dists=None, use_kl=False,  rollout_K=3):
+    #If not provided, sample the latent variables and distributions from the encoder (inference model) conditioned on the current sequence.
+    if latent_posterior_samples_and_dists is None:
+        latent_posterior_samples_and_dists = model.sample_posterior(images, actions, step_types) # q(z1_0 | x0)  , q(z2_0 | z1_0), q(z1_t | x_t, z2_{t-1}, a_{t-1}), q(z2_t | z1_t, z2_{t-1}, a_{t-1})
+        
+    #Latent variables and their corresponding distributions for both z1 and z2.
+    (z1_post, z2_post), (q_z1, q_z2) = latent_posterior_samples_and_dists
+    model._ensure_tabular_decoder(z1_post, z2_post)
+    preds_imgs   = model.decoder(z1_post, z2_post)
+    mse = ((images - preds_imgs)**2).mean()
+    output = {"mse": mse}
+
+    if use_kl:
+        p_z1, p_z2, p_z1_auto, p_z2_auto = model.get_prior(z1_post, z2_post, actions, step_types) # For every t=0…T−1: pψ(zt+1∣zt2,at) and pψ(zt+12∣zt+1,zt2,at)
+        kl_z1 = kl_divergence(q_z1.dists, p_z1.dists).sum(-1)
+
+        q1 = q_z1.dists.base_dist
+        p1 = p_z1.dists.base_dist
+
+        # KL balancing + free bits
+        tau = 0.02; alpha = 0.8
+        p1_det = torch.distributions.Normal(p1.loc.detach(), p1.scale.detach())
+        q1_det = torch.distributions.Normal(q1.loc.detach(), q1.scale.detach())
+
+        kl_q_raw = torch.distributions.kl_divergence(q1, p1_det)          # (B,T+1,D)
+        kl_p_raw = torch.distributions.kl_divergence(q1_det, p1)
+
+        kl_q = (kl_q_raw - tau).clamp_min(0).sum(-1).mean()               # scalar
+        kl_p = (kl_p_raw - tau).clamp_min(0).sum(-1).mean()
+
+        kl_bal = alpha * kl_q + (1 - alpha) * kl_p
+        target = 0.2  # aim each auxiliary to be ~20% of recon
+        kl_term   = (target * mse.detach() / (kl_bal.detach() + 1e-8)).clamp_(0, 1.0) * kl_bal
+        #pred_term = (target * mse.detach() / (pred_loss.detach() + 1e-8)).clamp_(0, 1.0) * pred_loss
+
+
+        # ----- 2) One-step prior consistency (GT inputs → predict t+1) ------------
+        with torch.no_grad():
+            z1_det, z2_det = z1_post.detach(), z2_post.detach()
+
+        p_z1, p_z2, p_z1_auto, p_z2_auto = model.get_prior(z1_det, z2_det, actions, step_types)
+
+        z1_next = z1_det[:, 1:]                 # (B,T,·)
+        z2_next = z2_det[:, 1:]                 # (B,T,·)
+        mu1 = p_z1_auto.base_dist.loc           # (B,T,·)
+        mu2 = p_z2_auto.base_dist.loc           # (B,T,·)
+        
+        latent_tf_mse = ((mu1 - z1_next)**2).mean() + ((mu2 - z2_next)**2).mean()
+
+        # Pixel one-step (decode predicted latents vs x_{t+1})
+        x_pred_next = model.decoder(mu1, mu2)                      # (B,T,1,H,W)
+        pix_tf_mse  = ((images[:, 1:] - x_pred_next) ** 2).mean()
+
+        loss = mse + kl_term + 0.1*latent_tf_mse + pix_tf_mse
+
+        output["kl_z1"] = kl_z1.mean()
+        output["kl_q_raw"] = kl_q_raw.mean()
+        output["kl_q"] = kl_q
+        output["kl_term"] = kl_term
+        output["latent_tf_mse"] = latent_tf_mse
+        output["pix_tf_mse"] = pix_tf_mse
+
+        return loss, output
+    else:
+        return mse, output
+
+def evaluate_policy(
+    env,
+    model,
+    agent,
+    args,
+    episodes: int = 5,
+    seed: int = 0,
+    record_video: bool = False,
+):
+    """
+    Evaluation helper.
+    Returns:
+        returns: list[float]
+        steps_list: list[int]
+        successes_strict: int
+        video: np.ndarray | None  (T,H,W,3) uint8 if record_video else None
+        metrics: dict with:
+            - time_to_first_band_entry_mean (nan if never entered in any ep)
+            - band_visits_mean
+            - success_rate_strict
+    """
+    rng = np.random.default_rng(seed)
+    device = args.device
+    world_radius = env.unwrapped.cfg.world_radius
+
+    returns, steps_list = [], []
+    successes_strict = 0
+    successes_reach = 0
+
+    t_first_list = []
+    band_visits_list = []
+
+    frames = [] if record_video else None
+
+    obs, info = env.reset(seed=rng.integers(0, 1_000_000))
+    if record_video:
+        frame = env.render()
+        if frame is not None:
+            frames.append(frame)
+
+    for ep in range(episodes):
+        print("episode:", ep+1)
+        if ep > 0:
+            obs, info = env.reset(seed=rng.integers(0, 1_000_000))
+            if record_video:
+                frame = env.render()
+                if frame is not None:
+                    frames.append(frame)
+
+        prev_action = torch.zeros(args.num_envs, dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            imgs0 = torch.from_numpy(obs).reshape(1, 1, -1).to(device).float() / world_radius
+            feat0 = model.encoder(imgs0)
+            z1_bel = model.latent1_first_posterior(feat0).rsample()
+            z2_bel = model.latent2_first_posterior(z1_bel).rsample()
+
+        ep_ret, steps = 0.0, 0
+        last_info = info
+        while True:
+            # -------- Bayes filter: PREDICT (priors) --------
+            with torch.no_grad():
+                a_one = F.one_hot(prev_action, num_classes=model.action_dim).float()
+                p1 = model.latent1_prior(z2_bel, a_one).base_dist
+                z1_prd = p1.loc
+                p2 = model.latent2_prior(z1_prd, z2_bel, a_one).base_dist
+                _z2_prd = p2.loc  # kept for completeness
+
+            # -------- Bayes filter: UPDATE (posteriors) --------
+            with torch.no_grad():
+                imgs = torch.from_numpy(obs).reshape(1, 1, -1).to(device).float() / world_radius
+                feat = model.encoder(imgs)
+                q1 = model.latent1_posterior(feat, z2_bel, a_one)
+                z1_t = q1.rsample()
+                q2 = model.latent2_posterior(z1_t, z2_bel, a_one)
+                z2_t = q2.rsample()
+                z1_bel, z2_bel = z1_t, z2_t
+
+                z_cat = torch.cat([z1_bel, z2_bel], dim=1)
+                action = agent.act(z_cat).squeeze(1).to(device)
+
+            obs, r, terminated, truncated, info = env.step(action)
+            last_info = info
+            prev_action = action
+            ep_ret += float(r)
+            steps += 1
+
+            if record_video:
+                frame = env.render()
+                if frame is not None:
+                    frames.append(frame)
+
+            if terminated or truncated:
+                # strict success flag from env if provided; fallback to terminated
+                #succ_strict = bool(info.get("success_strict", bool(terminated))) if isinstance(info, dict) else bool(terminated)
+                #successes_strict += int(succ_strict)
+                reached = bool(info.get("reached_goal", bool(terminated)))
+                succ_strict = bool(info.get("success_strict", False))  # strict only
+                successes_reach += int(reached)
+                successes_strict += int(succ_strict)
+                break
+
+        # Episode-level band metrics are tracked by env and surfaced in info
+        if isinstance(last_info, dict):
+            t_first = int(last_info.get("t_first_band_entry", -1))
+            band_visits = int(last_info.get("band_visits", 0))
+        else:
+            t_first, band_visits = -1, 0
+
+        returns.append(float(ep_ret))
+        steps_list.append(int(steps))
+        t_first_list.append(t_first)
+        band_visits_list.append(band_visits)
+
+    video = None
+    if record_video and frames:
+        video = np.stack(frames, axis=0)  # (T,H,W,3), uint8
+
+    # aggregate metrics
+    t_first_valid = [t for t in t_first_list if t is not None and t >= 0]
+    t_first_mean = float(np.mean(t_first_valid)) if len(t_first_valid) else float("nan")
+    band_visits_mean = float(np.mean(band_visits_list)) if len(band_visits_list) else float("nan")
+    #success_rate_strict = float(successes_strict) / float(episodes) if episodes > 0 else 0.0
+    success_rate_reach  = successes_reach / episodes
+    success_rate_strict = successes_strict / episodes
+
+    metrics = {
+        "time_to_first_band_entry_mean": t_first_mean,
+        "band_visits_mean": band_visits_mean,
+        "success_rate_strict": success_rate_strict,
+        "success_rate_reach": success_rate_reach
+    }
+
+    return returns, steps_list, successes_strict, successes_reach, video, metrics
+
+def evaluate_policy_deterministic(
+    env,
+    model,
+    agent,
+    args,
+    episodes: int = 5,
+    seed: int = 0,
+    record_video: bool = False,):
+    """
+    Reproducible evaluation helper.
+
+    Differences vs your original evaluate_policy():
+    - greedy actions: agent.act(..., epsilon=0.0)
+    - still uses posterior sampling with rsample()
+    - but torch / numpy RNG are reset per episode so results are reproducible
+
+    Returns:
+        returns: list[float]
+        steps_list: list[int]
+        successes_strict: int
+        successes_reach: int
+        video: np.ndarray | None  (T,H,W,3) uint8 if record_video else None
+        metrics: dict with:
+            - time_to_first_band_entry_mean
+            - band_visits_mean
+            - success_rate_strict
+            - success_rate_reach
+    """
+    rng = np.random.default_rng(seed)
+    device = args.device
+    world_radius = env.unwrapped.cfg.world_radius
+
+    returns, steps_list = [], []
+    successes_strict = 0
+    successes_reach = 0
+
+    t_first_list = []
+    band_visits_list = []
+
+    frames = [] if record_video else None
+
+    for ep in range(episodes):
+        print("episode:", ep + 1)
+
+        ep_seed = int(rng.integers(0, 1_000_000))
+
+        # Re-seed all RNGs used during posterior sampling for reproducibility
+        np.random.seed(ep_seed)
+        torch.manual_seed(ep_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(ep_seed)
+
+        obs, info = env.reset(seed=ep_seed)
+
+        if record_video:
+            frame = env.render()
+            if frame is not None:
+                frames.append(frame)
+
+        prev_action = torch.zeros(args.num_envs, dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            imgs0 = torch.from_numpy(obs).reshape(1, 1, -1).to(device).float() / world_radius
+            feat0 = model.encoder(imgs0)
+            z1_bel = model.latent1_first_posterior(feat0).rsample()
+            z2_bel = model.latent2_first_posterior(z1_bel).rsample()
+
+        ep_ret, steps = 0.0, 0
+        last_info = info
+
+        while True:
+            with torch.no_grad():
+                # -------- Bayes filter: PREDICT (priors) --------
+                a_one = F.one_hot(prev_action, num_classes=model.action_dim).float()
+                p1 = model.latent1_prior(z2_bel, a_one).base_dist
+                z1_prd = p1.loc
+                p2 = model.latent2_prior(z1_prd, z2_bel, a_one).base_dist
+                _z2_prd = p2.loc  # kept for completeness
+
+                # -------- Bayes filter: UPDATE (posteriors) --------
+                imgs = torch.from_numpy(obs).reshape(1, 1, -1).to(device).float() / world_radius
+                feat = model.encoder(imgs)
+
+                q1 = model.latent1_posterior(feat, z2_bel, a_one)
+                z1_t = q1.rsample()
+
+                q2 = model.latent2_posterior(z1_t, z2_bel, a_one)
+                z2_t = q2.rsample()
+
+                z1_bel, z2_bel = z1_t, z2_t
+
+                z_cat = torch.cat([z1_bel, z2_bel], dim=1)
+
+                # Greedy action selection: no epsilon-greedy randomness
+                action = agent.act(z_cat, epsilon=0.0).squeeze(1).to(device)
+
+            obs, r, terminated, truncated, info = env.step(action)
+            last_info = info
+            prev_action = action
+            ep_ret += float(r)
+            steps += 1
+
+            if record_video:
+                frame = env.render()
+                if frame is not None:
+                    frames.append(frame)
+
+            if terminated or truncated:
+                reached = bool(info.get("reached_goal", bool(terminated)))
+                succ_strict = bool(info.get("success_strict", False))
+                successes_reach += int(reached)
+                successes_strict += int(succ_strict)
+                break
+
+        if isinstance(last_info, dict):
+            t_first = int(last_info.get("t_first_band_entry", -1))
+            band_visits = int(last_info.get("band_visits", 0))
+        else:
+            t_first, band_visits = -1, 0
+
+        returns.append(float(ep_ret))
+        steps_list.append(int(steps))
+        t_first_list.append(t_first)
+        band_visits_list.append(band_visits)
+
+    video = None
+    if record_video and frames:
+        video = np.stack(frames, axis=0)
+
+    t_first_valid = [t for t in t_first_list if t is not None and t >= 0]
+    t_first_mean = float(np.mean(t_first_valid)) if len(t_first_valid) else float("nan")
+    band_visits_mean = float(np.mean(band_visits_list)) if len(band_visits_list) else float("nan")
+    success_rate_reach = successes_reach / episodes if episodes > 0 else 0.0
+    success_rate_strict = successes_strict / episodes if episodes > 0 else 0.0
+
+    metrics = {
+        "time_to_first_band_entry_mean": t_first_mean,
+        "band_visits_mean": band_visits_mean,
+        "success_rate_strict": success_rate_strict,
+        "success_rate_reach": success_rate_reach,
+    }
+
+    return returns, steps_list, successes_strict, successes_reach, video, metrics
+
+@torch.no_grad()
+def compute_uncertainty_diagnostics(
+    agent,
+    q_z1,
+    q_z2,
+    actions,
+    num_samples: int,
+):
+    """
+    Diagnostics for posterior spread, latent dispersion, and critic sensitivity.
+
+    Inputs
+    ------
+    q_z1, q_z2:
+        Posterior distribution containers returned by Model.sample_posterior(...)
+        Must have .dists with rsample() and base_dist.scale
+    actions:
+        Tensor of shape (B, S), discrete actions from replay
+    num_samples:
+        K posterior samples
+
+    Returns
+    -------
+    dict[str, torch.Tensor scalar]
+    """
+    device = actions.device
+    K = num_samples
+    B, S = actions.shape
+    T = S - 1
+    BT = B * T
+
+    # ------------------------------------------------------------
+    # A) posterior spread directly
+    # ------------------------------------------------------------
+    # q_z?.dists.base_dist.scale expected shape: (B, S, Dz)
+    std_z1 = q_z1.dists.base_dist.scale
+    std_z2 = q_z2.dists.base_dist.scale
+
+    post_z1_std_mean = std_z1.mean()
+    post_z2_std_mean = std_z2.mean()
+
+    post_z1_var_mean = (std_z1 ** 2).mean()
+    post_z2_var_mean = (std_z2 ** 2).mean()
+
+    # ------------------------------------------------------------
+    # Sample K posterior latent trajectories
+    # Shapes:
+    #   z1_samples: (K, B, S, D1)
+    #   z2_samples: (K, B, S, D2)
+    # ------------------------------------------------------------
+    z1_samples = q_z1.dists.rsample((K,))
+    z2_samples = q_z2.dists.rsample((K,))
+
+    # current transition latents only: t = 0..T-1
+    z1_t = z1_samples[:, :, :-1, :]   # (K, B, T, D1)
+    z2_t = z2_samples[:, :, :-1, :]   # (K, B, T, D2)
+    z_t = torch.cat([z1_t, z2_t], dim=-1)  # (K, B, T, D)
+
+    D = z_t.shape[-1]
+
+    # flatten transitions
+    z_flat = z_t.reshape(K, BT, D)    # (K, BT, D)
+
+    # ------------------------------------------------------------
+    # B) latent sample dispersion
+    # mean pairwise distance across samples for each transition
+    # ------------------------------------------------------------
+    # distances between all sample pairs
+    # diff: (K, K, BT, D)
+    diff = z_flat[:, None, :, :] - z_flat[None, :, :, :]
+    pairwise_dist = torch.norm(diff, dim=-1)  # (K, K, BT)
+
+    # use upper triangle only, exclude diagonal
+    tri_i, tri_j = torch.triu_indices(K, K, offset=1, device=device)
+    pairwise_dist_ut = pairwise_dist[tri_i, tri_j]  # (#pairs, BT)
+
+    latent_pairwise_dist_mean = pairwise_dist_ut.mean()
+
+    # ------------------------------------------------------------
+    # C) critic sensitivity to latent samples
+    # ------------------------------------------------------------
+    # taken actions aligned with t = 0..T-1
+    a_t = actions[:, :-1].reshape(BT)  # (BT,)
+    idx_bt = torch.arange(BT, device=device)
+
+    q_taken_list = []
+    p_taken_list = []
+    logits_taken_list = []
+
+    # critic support for expected-Q computation
+    support = agent.atoms.to(device)  # shape: (N_atoms,)
+
+    for k in range(K):
+        zk = z_flat[k]  # (BT, D)
+        zk = F.layer_norm(zk, zk.shape[-1:])
+
+        logits = agent._logits(zk)             # (BT, A, N_atoms)
+        probs = logits.softmax(dim=-1)         # (BT, A, N_atoms)
+
+        logits_taken = logits[idx_bt, a_t]     # (BT, N_atoms)
+        probs_taken = probs[idx_bt, a_t]       # (BT, N_atoms)
+
+        # scalar expected Q for taken action
+        q_taken = (probs_taken * support.unsqueeze(0)).sum(dim=-1)  # (BT,)
+
+        logits_taken_list.append(logits_taken)
+        p_taken_list.append(probs_taken)
+        q_taken_list.append(q_taken)
+
+    # stack over K
+    logits_taken_stack = torch.stack(logits_taken_list, dim=0)  # (K, BT, N_atoms)
+    p_taken_stack = torch.stack(p_taken_list, dim=0)            # (K, BT, N_atoms)
+    q_taken_stack = torch.stack(q_taken_list, dim=0)            # (K, BT)
+
+    # requested diagnostic:
+    # std across k of Q_k(a) for the taken action
+    q_taken_std_across_k = q_taken_stack.std(dim=0, unbiased=False)  # (BT,)
+    q_taken_std_mean = q_taken_std_across_k.mean()
+
+    # variance / std of probs and logits across posterior samples
+    probs_std_across_k = p_taken_stack.std(dim=0, unbiased=False)     # (BT, N_atoms)
+    logits_std_across_k = logits_taken_stack.std(dim=0, unbiased=False)
+
+    probs_std_mean = probs_std_across_k.mean()
+    logits_std_mean = logits_std_across_k.mean()
+
+    return {
+        "post_z1_std_mean": post_z1_std_mean,
+        "post_z2_std_mean": post_z2_std_mean,
+        "post_z1_var_mean": post_z1_var_mean,
+        "post_z2_var_mean": post_z2_var_mean,
+        "latent_pairwise_dist_mean": latent_pairwise_dist_mean,
+        "q_taken_std_mean": q_taken_std_mean,
+        "probs_std_mean": probs_std_mean,
+        "logits_std_mean": logits_std_mean,
+    }
+
+@torch.no_grad()
+def compute_relative_uncertainty_diagnostics(
+    agent,
+    q_z1,
+    q_z2,
+    actions,
+    num_samples: int,
+    eps: float = 1e-8,
+):
+    """
+    Relative diagnostics:
+      1) posterior std relative to latent mean magnitude
+      2) posterior sample dispersion relative to latent norm
+      3) value sensitivity relative to value magnitude
+
+    Returns dict[str, torch.Tensor scalar]
+    """
+    device = actions.device
+    K = num_samples
+    B, S = actions.shape
+    T = S - 1
+    BT = B * T
+
+    # ------------------------------------------------------------
+    # 1) posterior std relative to latent mean magnitude
+    # ------------------------------------------------------------
+    base1 = q_z1.dists.base_dist
+    base2 = q_z2.dists.base_dist
+
+    mu_z1 = base1.loc      # (B, S, D1)
+    std_z1 = base1.scale   # (B, S, D1)
+    mu_z2 = base2.loc      # (B, S, D2)
+    std_z2 = base2.scale   # (B, S, D2)
+
+    rel_post_z1_std = std_z1.mean() / (mu_z1.abs().mean() + eps)
+    rel_post_z2_std = std_z2.mean() / (mu_z2.abs().mean() + eps)
+
+    # ------------------------------------------------------------
+    # sample K posterior latent trajectories
+    # ------------------------------------------------------------
+    z1_samples = q_z1.dists.rsample((K,))   # (K, B, S, D1)
+    z2_samples = q_z2.dists.rsample((K,))   # (K, B, S, D2)
+
+    z1_t = z1_samples[:, :, :-1, :]         # (K, B, T, D1)
+    z2_t = z2_samples[:, :, :-1, :]         # (K, B, T, D2)
+    z_t = torch.cat([z1_t, z2_t], dim=-1)   # (K, B, T, D)
+
+    D = z_t.shape[-1]
+    z_flat = z_t.reshape(K, BT, D)          # (K, BT, D)
+
+    # posterior mean latent for current transitions
+    mu_t = torch.cat([mu_z1[:, :-1, :], mu_z2[:, :-1, :]], dim=-1)  # (B, T, D)
+    mu_t_flat = mu_t.reshape(BT, D)                                  # (BT, D)
+
+    # ------------------------------------------------------------
+    # 2) posterior sample dispersion relative to latent norm
+    # ------------------------------------------------------------
+    diff = z_flat[:, None, :, :] - z_flat[None, :, :, :]   # (K, K, BT, D)
+    pairwise_dist = torch.norm(diff, dim=-1)               # (K, K, BT)
+
+    tri_i, tri_j = torch.triu_indices(K, K, offset=1, device=device)
+    pairwise_dist_ut = pairwise_dist[tri_i, tri_j]         # (#pairs, BT)
+
+    pairwise_dist_mean = pairwise_dist_ut.mean()
+    latent_norm_mean = torch.norm(mu_t_flat, dim=-1).mean()
+
+    rel_latent_pairwise_dist = pairwise_dist_mean / (latent_norm_mean + eps)
+
+    # ------------------------------------------------------------
+    # 3) value sensitivity relative to value magnitude
+    #    for the taken action
+    # ------------------------------------------------------------
+    a_t = actions[:, :-1].reshape(BT)  # (BT,)
+    idx_bt = torch.arange(BT, device=device)
+
+    support = agent.atoms.to(device)   # (N_atoms,)
+
+    q_taken_list = []
+    for k in range(K):
+        zk = z_flat[k]                                  # (BT, D)
+        zk = F.layer_norm(zk, zk.shape[-1:])
+
+        logits = agent._logits(zk)                      # (BT, A, N_atoms)
+        probs = logits.softmax(dim=-1)                 # (BT, A, N_atoms)
+        probs_taken = probs[idx_bt, a_t]               # (BT, N_atoms)
+
+        q_taken = (probs_taken * support.unsqueeze(0)).sum(dim=-1)  # (BT,)
+        q_taken_list.append(q_taken)
+
+    q_taken_stack = torch.stack(q_taken_list, dim=0)   # (K, BT)
+
+    q_taken_std = q_taken_stack.std(dim=0, unbiased=False)          # (BT,)
+    q_taken_abs_mean = q_taken_stack.abs().mean(dim=0)              # (BT,)
+
+    q_taken_std_mean = q_taken_std.mean()
+    q_taken_abs_mean_global = q_taken_abs_mean.mean()
+
+    rel_q_taken_std = q_taken_std_mean / (q_taken_abs_mean_global + eps)
+
+    return {
+        "rel_post_z1_std": rel_post_z1_std,
+        "rel_post_z2_std": rel_post_z2_std,
+        "rel_latent_pairwise_dist": rel_latent_pairwise_dist,
+        "rel_q_taken_std": rel_q_taken_std,
+        "q_taken_abs_mean": q_taken_abs_mean_global,
+    }
+
+@torch.no_grad()
+def compute_all_action_uncertainty_diagnostics(
+    agent,
+    q_z1,
+    q_z2,
+    num_samples: int,
+    eps: float = 1e-8,
+):
+    """
+    Measure uncertainty sensitivity across ALL actions, not only the taken one.
+
+    Returns scalar diagnostics:
+      - mean std of expected Q across posterior samples, averaged over actions/states
+      - mean max std across actions
+      - std of best-action value across posterior samples
+      - argmax action disagreement rate across posterior samples
+    """
+    device = q_z1.dists.base_dist.loc.device
+    K = num_samples
+
+    # posterior samples
+    z1_samples = q_z1.dists.rsample((K,))   # (K, B, S, D1)
+    z2_samples = q_z2.dists.rsample((K,))   # (K, B, S, D2)
+
+    # current transitions only: t = 0..T-1
+    z1_t = z1_samples[:, :, :-1, :]         # (K, B, T, D1)
+    z2_t = z2_samples[:, :, :-1, :]         # (K, B, T, D2)
+    z_t = torch.cat([z1_t, z2_t], dim=-1)   # (K, B, T, D)
+
+    K, B, T, D = z_t.shape
+    BT = B * T
+
+    support = agent.atoms.to(device)        # (N_atoms,)
+
+    q_all_list = []
+    argmax_list = []
+
+    for k in range(K):
+        zk = z_t[k].reshape(BT, D)                          # (BT, D)
+        zk = F.layer_norm(zk, zk.shape[-1:])
+
+        logits = agent._logits(zk)                          # (BT, A, N_atoms)
+        probs = logits.softmax(dim=-1)                     # (BT, A, N_atoms)
+
+        # expected Q for all actions
+        q_all = (probs * support.view(1, 1, -1)).sum(dim=-1)   # (BT, A)
+
+        q_all_list.append(q_all)
+        argmax_list.append(q_all.argmax(dim=-1))           # (BT,)
+
+    # stack over posterior samples
+    q_all_stack = torch.stack(q_all_list, dim=0)           # (K, BT, A)
+    argmax_stack = torch.stack(argmax_list, dim=0)         # (K, BT)
+
+    # ------------------------------------------------------------
+    # 1) std across posterior samples for each action
+    # ------------------------------------------------------------
+    q_std_across_k = q_all_stack.std(dim=0, unbiased=False)    # (BT, A)
+
+    # average over actions and states
+    q_all_actions_std_mean = q_std_across_k.mean()
+
+    # for each state, take the action with largest std, then average states
+    q_max_action_std_mean = q_std_across_k.max(dim=-1).values.mean()
+
+    # relative versions
+    q_abs_mean = q_all_stack.abs().mean(dim=0)                 # (BT, A)
+    rel_q_std = q_std_across_k / (q_abs_mean + eps)            # (BT, A)
+
+    rel_q_all_actions_std_mean = rel_q_std.mean()
+    rel_q_max_action_std_mean = rel_q_std.max(dim=-1).values.mean()
+
+    # ------------------------------------------------------------
+    # 2) std of best-action value across posterior samples
+    # ------------------------------------------------------------
+    best_q_each_k = q_all_stack.max(dim=-1).values             # (K, BT)
+    best_q_std_mean = best_q_each_k.std(dim=0, unbiased=False).mean()
+
+    best_q_abs_mean = best_q_each_k.abs().mean(dim=0).mean()
+    rel_best_q_std_mean = best_q_std_mean / (best_q_abs_mean + eps)
+
+    # ------------------------------------------------------------
+    # 3) argmax action disagreement across posterior samples
+    # ------------------------------------------------------------
+    # For each state BT, how often do sampled argmax actions disagree?
+    # Compute fraction not equal to modal action.
+    disagreement_rates = []
+    for bt in range(BT):
+        acts = argmax_stack[:, bt]  # (K,)
+        values, counts = acts.unique(return_counts=True)
+        modal_count = counts.max()
+        disagreement = 1.0 - (modal_count.float() / K)
+        disagreement_rates.append(disagreement)
+
+    argmax_disagreement_mean = torch.stack(disagreement_rates).mean()
+
+    return {
+        "q_all_actions_std_mean": q_all_actions_std_mean,
+        "q_max_action_std_mean": q_max_action_std_mean,
+        "rel_q_all_actions_std_mean": rel_q_all_actions_std_mean,
+        "rel_q_max_action_std_mean": rel_q_max_action_std_mean,
+        "best_q_std_mean": best_q_std_mean,
+        "rel_best_q_std_mean": rel_best_q_std_mean,
+        "argmax_disagreement_mean": argmax_disagreement_mean,
+    }
+
+@torch.no_grad()
+def posterior_entropy_per_timestep(q_z1, q_z2):
+    """
+    Returns total posterior entropy per timestep.
+    Output shape: (B, S)
+    """
+    H1 = q_z1.dists.entropy()
+    H2 = q_z2.dists.entropy()
+
+    # If entropy returns per-dimension values, sum over latent dim
+    if H1.ndim == 3:
+        H1 = H1.sum(dim=-1)
+    if H2.ndim == 3:
+        H2 = H2.sum(dim=-1)
+
+    return H1 + H2
+
+@torch.no_grad()
+def compute_posterior_reduction_bonus(q_z1, q_z2):
+    """
+    r_t^info = H(q_t) - H(q_{t+1})
+    aligned to transitions t=0..S-2, to be added to rewards[:,1:].
+    Output shape: (B, S-1)
+    """
+    H = posterior_entropy_per_timestep(q_z1, q_z2)   # (B, S)
+    bonus = H[:, :-1] - H[:, 1:]                     # (B, S-1)
+    return bonus
+
+@torch.no_grad()
+def compute_action_disagreement_bonus(agent, q_z1, q_z2, num_samples: int):
+    """
+    For each transition t, sample K posterior latents, compute greedy action under each,
+    and reward disagreement across samples.
+
+    Output shape: (B, S-1)
+    """
+    device = q_z1.dists.base_dist.loc.device
+    K = num_samples
+
+    z1_samples = q_z1.dists.rsample((K,))   # (K, B, S, D1)
+    z2_samples = q_z2.dists.rsample((K,))   # (K, B, S, D2)
+
+    z1_t = z1_samples[:, :, :-1, :]
+    z2_t = z2_samples[:, :, :-1, :]
+    z_t = torch.cat([z1_t, z2_t], dim=-1)   # (K, B, S-1, D)
+
+    K, B, T, D = z_t.shape
+    BT = B * T
+
+    argmax_list = []
+
+    for k in range(K):
+        zk = z_t[k].reshape(BT, D)
+        zk = F.layer_norm(zk, zk.shape[-1:])
+
+        logits = agent._logits(zk)                      # (BT, A, N_atoms)
+        probs = logits.softmax(dim=-1)                 # (BT, A, N_atoms)
+        q_all = (probs * agent.atoms.to(device).view(1, 1, -1)).sum(dim=-1)  # (BT, A)
+
+        argmax_list.append(q_all.argmax(dim=-1))       # (BT,)
+
+    argmax_stack = torch.stack(argmax_list, dim=0)     # (K, BT)
+
+    disagreement = []
+    for bt in range(BT):
+        acts = argmax_stack[:, bt]
+        _, counts = acts.unique(return_counts=True)
+        modal_count = counts.max()
+        dis = 1.0 - (modal_count.float() / K)
+        disagreement.append(dis)
+
+    disagreement = torch.stack(disagreement).view(B, T)   # (B, S-1)
+    return disagreement
+
+@torch.no_grad()
+def scale_intrinsic_reward(raw_bonus, rewards, target_ratio=0.1, clip_value=2.0):
+    """
+    raw_bonus: (B, S-1)
+    rewards:   (B, S)
+
+    Returns:
+      bonus_proc: processed intrinsic bonus (B, S-1)
+      stats: dict of scalars
+    """
+    bonus_centered = raw_bonus - raw_bonus.mean()
+    bonus_clipped = torch.clamp(bonus_centered, -clip_value, clip_value)
+
+    env_abs_mean = rewards[:, 1:].abs().mean()
+    bonus_abs_mean = bonus_clipped.abs().mean()
+
+    auto_beta = target_ratio * env_abs_mean / (bonus_abs_mean + 1e-8)
+    auto_beta = torch.clamp(auto_beta, 0.0, 100.0)
+
+    bonus_scaled = auto_beta * bonus_clipped
+
+    stats = {
+        "raw_mean": raw_bonus.mean(),
+        "raw_std": raw_bonus.std(unbiased=False),
+        "scaled_mean": bonus_scaled.mean(),
+        "scaled_std": bonus_scaled.std(unbiased=False),
+        "scaled_abs_mean": bonus_scaled.abs().mean(),
+        "scaled_max_abs": bonus_scaled.abs().max(),
+        "auto_beta": auto_beta,
+    }
+    return bonus_scaled, stats
+
+@torch.no_grad()
+def compute_band_entropy_reduction_diagnostics(q_z1, q_z2, images, world_radius, band_center_x= -8.0 + 2.0/2, band_width=2.0):
+    """
+    Compute entropy reduction diagnostics split by band transition type.
+
+    Assumptions:
+    - tabular observation
+    - first two dims of observation are current position (x, y)
+    - images were normalized by / world_radius before being passed in
+    - band is a vertical strip centered at band_center_x with width band_width
+
+    Returns dict of scalar tensors:
+      - H_mean
+      - dH_mean
+      - dH_out_out
+      - dH_out_in
+      - dH_in_in
+      - dH_in_out
+      - frac_out_out
+      - frac_out_in
+      - frac_in_in
+      - frac_in_out
+    """
+    device = images.device
+
+    # ------------------------------------------------------------
+    # posterior entropy per timestep: shape (B, S)
+    # ------------------------------------------------------------
+    H = posterior_entropy_per_timestep(q_z1, q_z2)   # (B, S)
+    dH = H[:, :-1] - H[:, 1:]                        # (B, S-1)
+
+    # ------------------------------------------------------------
+    # recover x-position from normalized observations
+    # images shape assumed (B, S, obs_dim) or (B, S, 1, obs_dim)
+    # your code uses obs shape (1, obs_dim) in replay, so handle both
+    # ------------------------------------------------------------
+    obs = images
+    if obs.ndim == 4:
+        # (B, S, 1, obs_dim) -> (B, S, obs_dim)
+        obs = obs.squeeze(2)
+
+    x_t = obs[:, :-1, 0] * world_radius     # (B, S-1)
+    x_tp1 = obs[:, 1:, 0] * world_radius    # (B, S-1)
+
+    half_w = band_width / 2.0
+    in_t = (x_t >= (band_center_x - half_w)) & (x_t <= (band_center_x + half_w))
+    in_tp1 = (x_tp1 >= (band_center_x - half_w)) & (x_tp1 <= (band_center_x + half_w))
+
+    mask_out_out = (~in_t) & (~in_tp1)
+    mask_out_in  = (~in_t) & ( in_tp1)
+    mask_in_in   = ( in_t) & ( in_tp1)
+    mask_in_out  = ( in_t) & (~in_tp1)
+
+    def masked_mean(x, mask):
+        if mask.any():
+            return x[mask].mean()
+        return torch.tensor(float("nan"), device=device)
+
+    total = dH.numel()
+    frac_out_out = mask_out_out.float().sum() / total
+    frac_out_in  = mask_out_in.float().sum() / total
+    frac_in_in   = mask_in_in.float().sum() / total
+    frac_in_out  = mask_in_out.float().sum() / total
+
+    return {
+        "H_mean": H.mean(),
+        "dH_mean": dH.mean(),
+        "dH_out_out": masked_mean(dH, mask_out_out),
+        "dH_out_in": masked_mean(dH, mask_out_in),
+        "dH_in_in": masked_mean(dH, mask_in_in),
+        "dH_in_out": masked_mean(dH, mask_in_out),
+        "frac_out_out": frac_out_out,
+        "frac_out_in": frac_out_in,
+        "frac_in_in": frac_in_in,
+        "frac_in_out": frac_in_out,
+    }
+
+@torch.no_grad()
+def compute_band_bonus_diagnostics(raw_bonus, images, world_radius, band_center_x=-8.0 + 2.0/2, band_width=2.0):
+    """
+    Split any transition-level bonus (shape B x (S-1)) by band transition type.
+
+    Inputs
+    ------
+    raw_bonus : (B, S-1)
+        Transition-aligned intrinsic bonus before or after scaling.
+    images : normalized observations used in training batch
+    world_radius : scaling used to normalize observations
+
+    Assumes first obs dimension is x-position.
+    """
+    device = raw_bonus.device
+
+    obs = images
+    if obs.ndim == 4:
+        obs = obs.squeeze(2)   # (B,S,obs_dim)
+
+    x_t = obs[:, :-1, 0] * world_radius
+    x_tp1 = obs[:, 1:, 0] * world_radius
+
+    half_w = band_width / 2.0
+    in_t = (x_t >= (band_center_x - half_w)) & (x_t <= (band_center_x + half_w))
+    in_tp1 = (x_tp1 >= (band_center_x - half_w)) & (x_tp1 <= (band_center_x + half_w))
+
+    mask_out_out = (~in_t) & (~in_tp1)
+    mask_out_in  = (~in_t) & ( in_tp1)
+    mask_in_in   = ( in_t) & ( in_tp1)
+    mask_in_out  = ( in_t) & (~in_tp1)
+
+    def masked_mean(x, mask):
+        if mask.any():
+            return x[mask].mean()
+        return torch.tensor(float("nan"), device=device)
+
+    return {
+        "bonus_mean": raw_bonus.mean(),
+        "bonus_abs_mean": raw_bonus.abs().mean(),
+        "bonus_out_out": masked_mean(raw_bonus, mask_out_out),
+        "bonus_out_in": masked_mean(raw_bonus, mask_out_in),
+        "bonus_in_in": masked_mean(raw_bonus, mask_in_in),
+        "bonus_in_out": masked_mean(raw_bonus, mask_in_out),
+    }
+
+if __name__ == '__main__':
+    args = tyro.cli(Args)
+    #run_name = f"{args.env_id}__{int(time.time())}"
+    run_name = None
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    args.device = device
+    print(f"Using device: {args.device}")
+
+    run = None
+    writer = None
+
+    if args.track:
+        if args.disable_wandb_service:
+            os.environ.setdefault("WANDB_DISABLE_SERVICE", "true")
+        
+        wandb.login()
+        run = wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=None,
+            save_code=True,
+        )
+
+        code_art = wandb.Artifact("source-code", type="code")
+        code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\envs\\Light_dark_POMDP_flags.py")
+        code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SequenceReplayBuffer.py")
+        code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SLAC_Agent_deterministic_tabular.py")
+        code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SLAC_Agent_D3QN_tabular.py")
+        code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SLAC_light_dark_POMDP_C51_MI.py")
+        run.log_artifact(code_art)
+
+        # Make W&B use "global_step" as the step axis (avoid wandb.log(step=...))
+        run.define_metric("global_step")
+        run.define_metric("train/*", step_metric="global_step")
+        run.define_metric("eval/*", step_metric="global_step")
+        run.define_metric("eval_video/*", step_metric="global_step")
+
+        writer = SummaryWriter(f"runs/{run_name}")
+        writer.add_text(
+            "hyperparameters",
+            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{k}|{v}|" for k, v in vars(args).items()])),
+        )
+
+
+    env = make_env(
+        render_mode="rgb_array",
+        world_radius=10.0,
+        dt=0.2,
+        max_steps=300,
+        alpha=0.98,
+        beta=1.0,
+        a_max=0.5,
+        v_max=2.0,
+        c_max=None,   # MUST satisfy c_max <= beta * a_max (here beta=1, a_max=0.5)
+        fixed_c=None,
+        sigma_c=0.2,
+        sigma_eta=0.01,
+        # light–dark sensing
+        band_angle_deg=90.0,    # vertical white strip
+        band_center=(-8.0 + 2.0/2, 0.0),  # left side
+        band_width=2.0,
+        sigma_dark=3.0,
+        sigma_light=0.05,
+        # obs composition
+        include_goal_in_obs=True,
+        noisy_goal_obs=True,
+        # episode randomization
+        randomize_start=True,
+        randomize_goal=True,
+        min_start_goal_dist=6.0,
+        start_outside_band_prob=0.9,
+        require_opposite_band_side=False,
+        require_stop = False
+    )
+
+
+    env.unwrapped.cfg.max_steps =  args.max_episode_steps
+    env = DiscreteActionsEnv2(env, n_levels=5)
+    args.obs_kind = "tabular"
+    world_radius = env.unwrapped.cfg.world_radius
+    rng = np.random.default_rng(args.seed)
+    torch.manual_seed(args.seed)
+
+    obs, info = env.reset(seed=rng.integers(0, 1_000_000))
+    args.tabular_dim = obs.shape[0]
+
+    Model = ModelDistributionNetwork(env.action_space, args)
+    agent = D3QNAgent(env.action_space.n, args)
+    use_kl = False
+    if not args.from_scratch:
+        #ckpt = load_from_newest_run(Model, args.env_id, args, base_dir="checkpoints\\LightDarkNavigation_POMDP",
+        #                     filename="pretrained_model_fixedtarget_nocue.pth")
+    
+        ckpt = load_from_path(Model, args)
+
+    rb = SequenceReplayBuffer(
+        capacity   = args.buffer_size,
+        obs_shape  = (1,obs.shape[0]),
+        act_shape  = (),
+        seq_len    = args.sequence_len,
+        device     = args.device,
+        obs_dtype = torch.float32)
+    
+    episode_first = np.ones(args.num_envs, dtype=bool)   # True right after reset
+
+    ############################# THIS IS THE MODEL PRETRAINING ###############################
+    if args.from_scratch:
+        # 0. collect bootstrap data ------------------------------------------------
+        print("Collecting bootstrap data for model pretraining...")
+        while rb.ptr < 10_000:                 
+            action = env.action_space.sample()
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            step_type = np.where(
+                        [done],               2,
+                        np.where(episode_first, 0, 1)
+                    ).astype(np.int64)      # shape (n_envs,)
+
+            rb.add(obs[None,...], action, reward, done, step_type[0])
+            obs = next_obs
+            episode_first = done
+            if done:
+                obs, info = env.reset(seed=rng.integers(0, 1_000_000))
+                episode_first = np.ones(args.num_envs, dtype=bool)
+        
+        
+        # 1. model-only optimisation loop -----------------------------------------
+        print("Pretraining the model...")
+        reconstruction_losses_mse = []
+        reconstruction_losses_kl = []
+        for pretrain_step in tqdm(range(args.pretrain_steps)):
+            batch = rb.sample(args.batch_size)
+            obs  = (batch["obs"].float() / world_radius)    # normalize to [-1,1]
+            actions = batch["action"]
+            step_ty = batch["step_type"]
+            if pretrain_step < int(args.pretrain_steps / 2):
+                model_loss, output = compute_loss(Model, obs, actions, step_ty, step=pretrain_step, use_kl=False)
+                reconstruction_losses_mse.append(model_loss.item())
+            else:
+                model_loss, output = compute_loss(Model, obs, actions, step_ty, step=pretrain_step, use_kl=True)
+                reconstruction_losses_kl.append(model_loss.item())
+            Model.optimizer.zero_grad()
+            model_loss.backward()
+            Model.optimizer.step()
+            #reconstruction_losses.append(model_loss.item())
+        if args.save_model:
+            path = f"checkpoints\\LightDarkNavigation_POMDP\\{run_name}\\pretrained_model_fixedtarget_nocue.pth"
+            save_world_model_ckpt(Model, pretrain_step+1, path)
+            pkl.dump([reconstruction_losses_mse, reconstruction_losses_kl], open(f"light_dark_model_reconstruction_losses.pkl", "wb"))
+            #log_checkpoint_to_wandb(path, pretrain_step+1, run, aliases=("pretrain", "latest"))
+
+        ######################## END OF MODEL PRETRAINING ###############################
+        print("Model pretraining completed.")
+
+    #####################################################################################
+
+    ep_return = 0.0
+    ep_len = 0
+    episodes = 0
+
+    #start the game
+    # ---- reset & init belief with FIRST posteriors (uses latent1_first_posterior) ----
+    obs, _ = env.reset(seed=args.seed)
+    episode_first = np.ones(args.num_envs, dtype=bool)   # True right after reset
+    # previous action indices per env (start with NOOP index = 0)
+    prev_action = torch.zeros(args.num_envs, dtype=torch.long, device=args.device) # NOOP
+    start_time = time.time()
+
+    with torch.no_grad():
+        imgs0  = torch.from_numpy(obs).reshape(1,1,-1).to(args.device).float() / world_radius
+        feat0  = Model.encoder(imgs0)                           # (N, feat)
+        z1_bel = Model.latent1_first_posterior(feat0).rsample() # (N, d1)
+        z2_bel = Model.latent2_first_posterior(z1_bel).rsample()# (N, d2)
+
+    for global_step in tqdm(range(args.total_timesteps+1)):
+        agent.epsilon = agent.linear_schedule(args.start_e, args.end_e, int(args.exploration_fraction * args.total_timesteps), global_step)
+
+     # -------- Bayes filter: PREDICT (use PRIORS) --------
+        with torch.no_grad():
+            a_one  = F.one_hot(prev_action, num_classes=Model.action_dim).float()  # (N,A)
+            # p(z^1_t | z^2_{t-1}, a_{t-1})
+            p1     = Model.latent1_prior(z2_bel, a_one).base_dist
+            z1_prd = p1.loc  # mean prediction (lower variance than sampling)
+            # p(z^2_t | z^1_t, z^2_{t-1}, a_{t-1})
+            p2     = Model.latent2_prior(z1_prd, z2_bel, a_one).base_dist
+            z2_prd = p2.loc
+        
+        # -------- Bayes filter: UPDATE (use POSTERIORS with current frame) --------
+        with torch.no_grad():
+            imgs = torch.from_numpy(obs).reshape(1,1,-1).to(device).float() / world_radius
+            feat = Model.encoder(imgs)  # (N, feat)
+            # q(z^1_t | x_t, z^2_{t-1}, a_{t-1})
+            q1   = Model.latent1_posterior(feat, z2_bel, a_one)
+            z1_t = q1.rsample()
+            # q(z^2_t | z^1_t, z^2_{t-1}, a_{t-1})
+            q2   = Model.latent2_posterior(z1_t, z2_bel, a_one)
+            z2_t = q2.rsample()
+
+            z1_bel, z2_bel = z1_t, z2_t
+        
+        if random.random() < agent.epsilon:     
+            action = torch.as_tensor([env.action_space.sample() for _ in range(args.num_envs)], device=device, dtype=torch.long) 
+        else:
+            z_cat = torch.cat([z1_bel, z2_bel], dim=1)     # (N, d1+d2)
+            action = agent.act(z_cat).squeeze(1).to(device) # (N,)
+        
+        next_obs, reward, termination, truncation, info = env.step(action)
+        done = termination | truncation
+
+        # remember actions for next predict/update
+        prev_action = action
+        
+        step_type = np.where(done, 2, np.where(episode_first, 0, 1)).astype(np.int64)  # shape (n_envs,)
+
+        rb.add(obs[None,...], action, reward, done, step_type[0])
+
+        ep_return += float(reward)
+        ep_len += 1
+
+        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+
+
+        # -------- RE-INIT belief on resets (uses latent1_first_posterior again) --------
+        if done == True:
+            obs, info = env.reset(seed=rng.integers(0, 1_000_000))
+            episode_first = np.ones(args.num_envs, dtype=bool) 
+            prev_action = torch.zeros(args.num_envs, dtype=torch.long, device=args.device) # NOOP
+            with torch.no_grad():
+                imgs0  = torch.from_numpy(obs).reshape(1,1,-1).to(args.device).float() / world_radius
+                feat0  = Model.encoder(imgs0)                           # (N, feat)
+                z1_bel = Model.latent1_first_posterior(feat0).rsample() # (N, d1)
+                z2_bel = Model.latent2_first_posterior(z1_bel).rsample()# (N, d2)
+            
+            episodes += 1
+            if writer is not None:
+                writer.add_scalar("train/episode_return", ep_return, global_step)
+                writer.add_scalar("train/episode_length", ep_len, global_step)
+                writer.add_scalar("train/episodes", episodes, global_step)
+            ep_return = 0.0
+            ep_len = 0
+        else:
+            obs = next_obs
+            episode_first = np.array([done], dtype=bool)
+
+
+        if global_step > args.learning_starts and global_step % args.train_frequency == 0:            
+            #with tic("sample"):
+            data = rb.sample(args.batch_size)
+            images  = data["obs"].to(dtype=torch.float32).div_(world_radius)
+            actions = data["action"]
+            step_ty = data["step_type"]
+            rewards = data["reward"]
+            dones   = data["done"]
+
+            if global_step % (args.world_model_update_frequency * args.train_frequency) == 0:
+                model_loss, output = compute_loss(Model, images, actions, step_ty, use_kl=True)
+                Model.optimizer.zero_grad()
+                model_loss.backward()
+                torch.nn.utils.clip_grad_norm_(Model.parameters(), 20.0)
+                Model.optimizer.step()
+            
+            with torch.no_grad():
+                # Posterior latents & posterior distributions
+                (z1, z2), (q_z1, q_z2) = Model.sample_posterior(images, actions, step_ty)
+            
+                band_entropy_stats = None
+                if args.diag_use and (global_step % args.diag_every == 0):
+                    band_entropy_stats = compute_band_entropy_reduction_diagnostics(
+                        q_z1=q_z1,
+                        q_z2=q_z2,
+                        images=images,
+                        world_radius=world_radius,
+                        band_center_x=(-8.0 + 2.0/2),
+                        band_width=2.0,
+                    )
+
+            # ------------------------------------------------------------
+            # Optional diagnostics
+            # ------------------------------------------------------------
+                diag_stats = None
+                if args.diag_use and (global_step % args.diag_every == 0):
+                    diag_stats = compute_uncertainty_diagnostics(
+                        agent=agent,
+                        q_z1=q_z1,
+                        q_z2=q_z2,
+                        actions=actions,
+                        num_samples=args.diag_num_samples,
+                    )
+                
+                rel_diag_stats = None
+                if args.diag_use and (global_step % args.diag_every == 0):
+                    rel_diag_stats = compute_relative_uncertainty_diagnostics(
+                        agent=agent,
+                        q_z1=q_z1,
+                        q_z2=q_z2,
+                        actions=actions,
+                        num_samples=args.diag_num_samples,
+                    )
+                
+                all_action_diag_stats = None
+                if args.diag_use and (global_step % args.diag_every == 0):
+                    all_action_diag_stats = compute_all_action_uncertainty_diagnostics(
+                        agent=agent,
+                        q_z1=q_z1,
+                        q_z2=q_z2,
+                        num_samples=args.diag_num_samples,
+                    )
+
+                """# Optional MI bonus (aligned with transitions t=0..S-2, attached to r_{t+1})
+                #if args.mi_use and args.mi_beta > 0.0:
+                if args.mi_use:
+                    # ------------------------------------------------------------
+                    # Test A: compute MI without perturbing the later torch RNG stream
+                    # ------------------------------------------------------------
+                    #cpu_rng_state = torch.get_rng_state()
+                    #cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+                    mi_bonus = compute_mi_bonus(
+                        agent=agent,
+                        q_z1=q_z1,
+                        q_z2=q_z2,
+                        actions=actions,
+                        step_types=step_ty,
+                        mi_num_samples=args.mi_num_samples,
+                    )  # shape: (B, S-1)
+
+                    # Restore RNG state so MI sampling does not change later rsample() draws
+                    #torch.set_rng_state(cpu_rng_state)
+                    #if cuda_rng_state is not None:
+                        #torch.cuda.set_rng_state_all(cuda_rng_state)
+
+                    # ------------------------------------------------------------
+                    # MI shaping
+                    # ------------------------------------------------------------
+                    mi_centered = mi_bonus - mi_bonus.mean()
+                    mi_clip = torch.clamp(mi_centered, -args.mi_clip_value, args.mi_clip_value)
+                    env_abs_mean = rewards[:, 1:].abs().mean()
+                    mi_abs_mean = mi_clip.abs().mean()
+                    auto_beta = args.mi_target_ratio * env_abs_mean / (mi_abs_mean + 1e-8)
+                    mi_shaped = auto_beta * mi_clip
+                    #mi_shaped = args.mi_beta * mi_clip
+                    #mi_shaped_0 = 0.0
+
+                    rewards_total = rewards.clone()
+                    rewards_total[:, 1:] = rewards_total[:, 1:] + mi_shaped
+
+                    # ------------------------------------------------------------
+                    # Magnitudes that actually matter
+                    # ------------------------------------------------------------
+                    mi_raw_mean = mi_bonus.mean()
+                    mi_raw_std = mi_bonus.std(unbiased=False)
+
+                    mi_shaped_mean = mi_shaped.mean()
+                    mi_shaped_std = mi_shaped.std(unbiased=False)
+                    mi_shaped_abs_mean = mi_shaped.abs().mean()
+                    mi_shaped_max_abs = mi_shaped.abs().max()
+
+                    env_reward_mean = rewards[:, 1:].mean()
+                    env_reward_std = rewards[:, 1:].std(unbiased=False)
+                    env_reward_abs_mean = rewards[:, 1:].abs().mean()
+                    env_reward_max_abs = rewards[:, 1:].abs().max()
+                    mi_to_env_ratio = mi_shaped_abs_mean / (env_reward_abs_mean + 1e-8)
+
+                else:
+                    rewards_total = rewards"""
+                
+                # ------------------------------------------------------------
+                # intrinsic reward block
+                # ------------------------------------------------------------
+                raw_bonus = None
+                intrinsic_bonus = None
+                intrinsic_stats = None
+                bonus_band_stats_raw = None
+                bonus_band_stats_scaled = None
+
+                if args.intrinsic_mode == "posterior_reduction":
+                    raw_bonus = compute_posterior_reduction_bonus(q_z1, q_z2)
+
+                    if args.intrinsic_use_running_scale:
+                        bonus_scaled, intrinsic_stats = scale_intrinsic_reward(
+                            raw_bonus,
+                            rewards,
+                            target_ratio=args.intrinsic_target_ratio,
+                            clip_value=args.intrinsic_clip_value,
+                        )
+                        intrinsic_bonus = bonus_scaled
+                    else:
+                        bonus_centered = raw_bonus - raw_bonus.mean()
+                        bonus_clipped = torch.clamp(bonus_centered, -args.intrinsic_clip_value, args.intrinsic_clip_value)
+                        intrinsic_bonus = args.intrinsic_beta * bonus_clipped
+
+                elif args.intrinsic_mode == "action_disagreement":
+                    raw_bonus = compute_action_disagreement_bonus(
+                        agent=agent,
+                        q_z1=q_z1,
+                        q_z2=q_z2,
+                        num_samples=args.intrinsic_num_samples,
+                    )
+
+                    if args.intrinsic_use_running_scale:
+                        bonus_scaled, intrinsic_stats = scale_intrinsic_reward(
+                            raw_bonus,
+                            rewards,
+                            target_ratio=args.intrinsic_target_ratio,
+                            clip_value=args.intrinsic_clip_value,
+                        )
+                        intrinsic_bonus = bonus_scaled
+                    else:
+                        bonus_centered = raw_bonus - raw_bonus.mean()
+                        bonus_clipped = torch.clamp(bonus_centered, -args.intrinsic_clip_value, args.intrinsic_clip_value)
+                        intrinsic_bonus = args.intrinsic_beta * bonus_clipped
+
+                if intrinsic_bonus is not None:
+                    rewards_total = rewards.clone()
+                    rewards_total[:, 1:] = rewards_total[:, 1:] + intrinsic_bonus
+                else:
+                    rewards_total = rewards
+
+                if args.diag_use and (global_step % args.diag_every == 0):
+                    if raw_bonus is not None:
+                        bonus_band_stats_raw = compute_band_bonus_diagnostics(
+                            raw_bonus=raw_bonus,
+                            images=images,
+                            world_radius=world_radius,
+                            band_center_x=(-8.0 + 2.0/2),
+                            band_width=2.0,
+                        )
+                    if intrinsic_bonus is not None:
+                        bonus_band_stats_scaled = compute_band_bonus_diagnostics(
+                            raw_bonus=intrinsic_bonus,
+                            images=images,
+                            world_radius=world_radius,
+                            band_center_x=(-8.0 + 2.0/2),
+                            band_width=2.0,
+                        )
+            
+            #print("intrinsic_stats", intrinsic_stats)
+            #print("intrinsic_bonus", intrinsic_bonus)
+
+            q_loss, q_pred, target_q = agent.compute_loss(z1, z2, actions, rewards_total, dones)
+
+            agent.update(q_loss)
+
+            if global_step % args.target_network_frequency == 0:
+                agent.update_target_model()
+            
+            if global_step % args.video_every == 0 and global_step > 0:
+                returns, steps_list, successes_strict, successes_reach, video, eval_metrics = evaluate_policy_deterministic(
+                    env, Model, agent, args,
+                    episodes=20,
+                    seed=args.seed,
+                    record_video=True,
+                )
+                ret_mean = float(np.mean(returns)) if len(returns) else 0.0
+                len_mean = float(np.mean(steps_list)) if len(steps_list) else 0.0
+                succ_strict_rate = float(successes_strict) / float(len(returns)) if len(returns) else 0.0
+                succ_reach_rate = float(successes_reach) / float(len(returns)) if len(returns) else 0.0
+
+                if writer is not None:
+                    writer.add_scalar("eval_video/return_mean", ret_mean, global_step)
+                    writer.add_scalar("eval_video/ep_len_mean", len_mean, global_step)
+                    writer.add_scalar("eval_video/success_strict_rate", succ_strict_rate, global_step)
+                    writer.add_scalar("eval_video/success_reach_rate", succ_reach_rate, global_step)
+                    writer.add_scalar("eval_video/time_to_first_band_entry_mean", eval_metrics["time_to_first_band_entry_mean"], global_step)
+                    writer.add_scalar("eval_video/band_visits_mean", eval_metrics["band_visits_mean"], global_step)
+                    #writer.add_scalar("eval_video/success_rate_strict", eval_metrics["success_rate_strict"], global_step)
+                    writer.add_scalar("eval_video/successes_strict", successes_strict, global_step)
+                    writer.add_scalar("eval_video/successes_reach", successes_reach, global_step)
+
+                if run is not None and video is not None:
+                    log_video_to_wandb(video, fps=args.video_fps, key="eval/video", step=global_step, run=run)
+
+                tqdm.write(f"[{global_step}] Eval(video) | Return {ret_mean:.3f} | Steps {len_mean:.1f} | Success(strict) {eval_metrics['success_rate_strict']:.2f} | FirstBand {eval_metrics['time_to_first_band_entry_mean']} | BandVisits {eval_metrics['band_visits_mean']:.2f}")
+
+
+            if global_step % args.eval_every == 0 and global_step > 0:
+                returns, steps_list, successes_strict, successes_reach, video, eval_metrics = evaluate_policy_deterministic(
+                    env, Model, agent, args,
+                    episodes=50,
+                    seed=args.seed,
+                    record_video=False,
+                )
+                ret_mean = float(np.mean(returns)) if len(returns) else 0.0
+                len_mean = float(np.mean(steps_list)) if len(steps_list) else 0.0
+                succ_strict_rate = float(successes_strict) / float(len(returns)) if len(returns) else 0.0
+                succ_reach_rate = float(successes_reach) / float(len(returns)) if len(returns) else 0.0
+
+                if writer is not None:
+                    writer.add_scalar("eval/return_mean", ret_mean, global_step)
+                    writer.add_scalar("eval/ep_len_mean", len_mean, global_step)
+                    writer.add_scalar("eval/success_strict_rate", succ_strict_rate, global_step)
+                    writer.add_scalar("eval/success_reach_rate", succ_reach_rate, global_step)
+                    writer.add_scalar("eval/time_to_first_band_entry_mean", eval_metrics["time_to_first_band_entry_mean"], global_step)
+                    writer.add_scalar("eval/band_visits_mean", eval_metrics["band_visits_mean"], global_step)
+                    #writer.add_scalar("eval/success_rate_strict", eval_metrics["success_rate_strict"], global_step)
+                    writer.add_scalar("eval/successes_strict", successes_strict, global_step)
+                    writer.add_scalar("eval/successes_reach", successes_reach, global_step)
+
+                tqdm.write(f"[{global_step}] Eval | Return {ret_mean:.3f} | Steps {len_mean:.1f} | Success(strict) {eval_metrics['success_rate_strict']:.2f} | FirstBand {eval_metrics['time_to_first_band_entry_mean']} | BandVisits {eval_metrics['band_visits_mean']:.2f}")
+   
+            if global_step % 500 == 0 and writer is not None:
+                writer.add_scalar("train/epsilon", agent.epsilon, global_step)
+                writer.add_scalar("train/q_loss", float(q_loss.item()), global_step)
+                writer.add_scalar("train/q_pred_mean", float(q_pred.mean().item()), global_step)
+                writer.add_scalar("train/rewards_mean", rewards.mean().item(), global_step)
+                writer.add_scalar("train/world_model_loss", model_loss.item(), global_step)
+
+                """#if args.mi_use and args.mi_beta > 0.0:
+                if args.mi_use:
+                    writer.add_scalar("train/mi_raw_mean", mi_raw_mean, global_step)
+                    writer.add_scalar("train/mi_raw_std", mi_raw_std, global_step)
+                    writer.add_scalar("train/mi_shaped_mean", mi_shaped_mean, global_step)
+                    writer.add_scalar("train/mi_shaped_std", mi_shaped_std, global_step)
+                    writer.add_scalar("train/mi_shaped_abs_mean", mi_shaped_abs_mean, global_step)
+                    writer.add_scalar("train/mi_shaped_max_abs", mi_shaped_max_abs, global_step)
+                    writer.add_scalar("train/env_reward_mean", env_reward_mean, global_step)
+                    writer.add_scalar("train/env_reward_std", env_reward_std, global_step)
+                    writer.add_scalar("train/env_reward_abs_mean", env_reward_abs_mean, global_step)
+                    writer.add_scalar("train/env_reward_max_abs", env_reward_max_abs, global_step)
+                    writer.add_scalar("train/mi_clip_mean", mi_clip.mean().item(), global_step)
+                    writer.add_scalar("train/mi_clip_max", mi_clip.max().item(), global_step)
+                    writer.add_scalar("train/mi_clip_min", mi_clip.min().item(), global_step)
+                    writer.add_scalar("train/mi_to_env_abs_ratio", mi_to_env_ratio.item(), global_step)"""
+                if intrinsic_stats is not None:
+                    writer.add_scalar("intrinsic/raw_mean", intrinsic_stats["raw_mean"].item(), global_step)
+                    writer.add_scalar("intrinsic/raw_std", intrinsic_stats["raw_std"].item(), global_step)
+                    writer.add_scalar("intrinsic/scaled_mean", intrinsic_stats["scaled_mean"].item(), global_step)
+                    writer.add_scalar("intrinsic/scaled_std", intrinsic_stats["scaled_std"].item(), global_step)
+                    writer.add_scalar("intrinsic/scaled_abs_mean", intrinsic_stats["scaled_abs_mean"].item(), global_step)
+                    writer.add_scalar("intrinsic/scaled_max_abs", intrinsic_stats["scaled_max_abs"].item(), global_step)
+                    writer.add_scalar("intrinsic/auto_beta", intrinsic_stats["auto_beta"].item(), global_step)
+                
+                if intrinsic_stats is not None:
+                    env_reward_abs_mean = rewards[:, 1:].abs().mean()
+                    ratio = intrinsic_stats["scaled_abs_mean"] / (env_reward_abs_mean + 1e-8)
+                    writer.add_scalar("intrinsic/to_env_abs_ratio", ratio.item(), global_step)
+                
+                if diag_stats is not None:
+                    writer.add_scalar("diag/post_z1_std_mean", diag_stats["post_z1_std_mean"].item(), global_step)
+                    writer.add_scalar("diag/post_z2_std_mean", diag_stats["post_z2_std_mean"].item(), global_step)
+                    writer.add_scalar("diag/post_z1_var_mean", diag_stats["post_z1_var_mean"].item(), global_step)
+                    writer.add_scalar("diag/post_z2_var_mean", diag_stats["post_z2_var_mean"].item(), global_step)
+
+                    writer.add_scalar("diag/latent_pairwise_dist_mean", diag_stats["latent_pairwise_dist_mean"].item(), global_step)
+
+                    writer.add_scalar("diag/q_taken_std_mean", diag_stats["q_taken_std_mean"].item(), global_step)
+                    writer.add_scalar("diag/probs_std_mean", diag_stats["probs_std_mean"].item(), global_step)
+                    writer.add_scalar("diag/logits_std_mean", diag_stats["logits_std_mean"].item(), global_step)
+                
+                if band_entropy_stats is not None:
+                    writer.add_scalar("diag_entropy/H_mean", band_entropy_stats["H_mean"].item(), global_step)
+                    writer.add_scalar("diag_entropy/dH_mean", band_entropy_stats["dH_mean"].item(), global_step)
+
+                    if not torch.isnan(band_entropy_stats["dH_out_out"]):
+                        writer.add_scalar("diag_entropy/dH_out_out", band_entropy_stats["dH_out_out"].item(), global_step)
+                    if not torch.isnan(band_entropy_stats["dH_out_in"]):
+                        writer.add_scalar("diag_entropy/dH_out_in", band_entropy_stats["dH_out_in"].item(), global_step)
+                    if not torch.isnan(band_entropy_stats["dH_in_in"]):
+                        writer.add_scalar("diag_entropy/dH_in_in", band_entropy_stats["dH_in_in"].item(), global_step)
+                    if not torch.isnan(band_entropy_stats["dH_in_out"]):
+                        writer.add_scalar("diag_entropy/dH_in_out", band_entropy_stats["dH_in_out"].item(), global_step)
+
+                    writer.add_scalar("diag_entropy/frac_out_out", band_entropy_stats["frac_out_out"].item(), global_step)
+                    writer.add_scalar("diag_entropy/frac_out_in", band_entropy_stats["frac_out_in"].item(), global_step)
+                    writer.add_scalar("diag_entropy/frac_in_in", band_entropy_stats["frac_in_in"].item(), global_step)
+                    writer.add_scalar("diag_entropy/frac_in_out", band_entropy_stats["frac_in_out"].item(), global_step)
+                
+                if bonus_band_stats_raw is not None:
+                    writer.add_scalar("diag_bonus_raw/mean", bonus_band_stats_raw["bonus_mean"].item(), global_step)
+                    writer.add_scalar("diag_bonus_raw/abs_mean", bonus_band_stats_raw["bonus_abs_mean"].item(), global_step)
+
+                    if not torch.isnan(bonus_band_stats_raw["bonus_out_out"]):
+                        writer.add_scalar("diag_bonus_raw/out_out", bonus_band_stats_raw["bonus_out_out"].item(), global_step)
+                    if not torch.isnan(bonus_band_stats_raw["bonus_out_in"]):
+                        writer.add_scalar("diag_bonus_raw/out_in", bonus_band_stats_raw["bonus_out_in"].item(), global_step)
+                    if not torch.isnan(bonus_band_stats_raw["bonus_in_in"]):
+                        writer.add_scalar("diag_bonus_raw/in_in", bonus_band_stats_raw["bonus_in_in"].item(), global_step)
+                    if not torch.isnan(bonus_band_stats_raw["bonus_in_out"]):
+                        writer.add_scalar("diag_bonus_raw/in_out", bonus_band_stats_raw["bonus_in_out"].item(), global_step)
+
+                if bonus_band_stats_scaled is not None:
+                    writer.add_scalar("diag_bonus_scaled/mean", bonus_band_stats_scaled["bonus_mean"].item(), global_step)
+                    writer.add_scalar("diag_bonus_scaled/abs_mean", bonus_band_stats_scaled["bonus_abs_mean"].item(), global_step)
+
+                    if not torch.isnan(bonus_band_stats_scaled["bonus_out_out"]):
+                        writer.add_scalar("diag_bonus_scaled/out_out", bonus_band_stats_scaled["bonus_out_out"].item(), global_step)
+                    if not torch.isnan(bonus_band_stats_scaled["bonus_out_in"]):
+                        writer.add_scalar("diag_bonus_scaled/out_in", bonus_band_stats_scaled["bonus_out_in"].item(), global_step)
+                    if not torch.isnan(bonus_band_stats_scaled["bonus_in_in"]):
+                        writer.add_scalar("diag_bonus_scaled/in_in", bonus_band_stats_scaled["bonus_in_in"].item(), global_step)
+                    if not torch.isnan(bonus_band_stats_scaled["bonus_in_out"]):
+                        writer.add_scalar("diag_bonus_scaled/in_out", bonus_band_stats_scaled["bonus_in_out"].item(), global_step)
+                                
+                if rel_diag_stats is not None:
+                    writer.add_scalar("diag_rel/post_z1_std_over_mean_abs", rel_diag_stats["rel_post_z1_std"].item(), global_step)
+                    writer.add_scalar("diag_rel/post_z2_std_over_mean_abs", rel_diag_stats["rel_post_z2_std"].item(), global_step)
+                    writer.add_scalar("diag_rel/latent_pairwise_dist_over_latent_norm", rel_diag_stats["rel_latent_pairwise_dist"].item(), global_step)
+                    writer.add_scalar("diag_rel/q_taken_std_over_q_taken_abs_mean", rel_diag_stats["rel_q_taken_std"].item(), global_step)
+                    writer.add_scalar("diag_rel/q_taken_abs_mean", rel_diag_stats["q_taken_abs_mean"].item(), global_step)
+                
+                if all_action_diag_stats is not None:
+                    writer.add_scalar("diag_all_actions/q_all_actions_std_mean", all_action_diag_stats["q_all_actions_std_mean"].item(), global_step)
+                    writer.add_scalar("diag_all_actions/q_max_action_std_mean", all_action_diag_stats["q_max_action_std_mean"].item(), global_step)
+
+                    writer.add_scalar("diag_all_actions/rel_q_all_actions_std_mean", all_action_diag_stats["rel_q_all_actions_std_mean"].item(), global_step)
+                    writer.add_scalar("diag_all_actions/rel_q_max_action_std_mean", all_action_diag_stats["rel_q_max_action_std_mean"].item(), global_step)
+
+                    writer.add_scalar("diag_all_actions/best_q_std_mean", all_action_diag_stats["best_q_std_mean"].item(), global_step)
+                    writer.add_scalar("diag_all_actions/rel_best_q_std_mean", all_action_diag_stats["rel_best_q_std_mean"].item(), global_step)
+
+                    writer.add_scalar("diag_all_actions/argmax_disagreement_mean", all_action_diag_stats["argmax_disagreement_mean"].item(), global_step)
+
+    
+    if writer is not None:
+        writer.close()
+    if run is not None:
+        run.finish()
+
