@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:alexlee-gk.github.io)",
+      "WebFetch(domain:ar5iv.labs.arxiv.org)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sys; sys.stdout.buffer.write\\(sys.stdin.buffer.read\\(\\)\\)\")",
+      "Bash(python -c \"import fitz; doc = fitz.open\\('POMDP-3.pdf'\\); text = '\\\\n'.join\\([f'=== PAGE {i+1} ===\\\\n{p.get_text\\(\\)}' for i,p in enumerate\\(doc\\)]\\); open\\('/tmp/pomdp3.txt','w',encoding='utf-8'\\).write\\(text\\); print\\('Pages:', len\\(doc\\)\\)\")"
+    ]
+  }
+}

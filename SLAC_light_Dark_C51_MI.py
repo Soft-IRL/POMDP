@@ -51,11 +51,11 @@ class Args:
     """the standard deviation of the light region noise"""
 
     # Algorithm specific arguments
-    total_timesteps: int = 300_000
+    total_timesteps: int = 500_000
     """total timesteps of the experiments"""
     max_episode_steps: int = 200
     """max timesteps per episode"""
-    pretrain_steps: int = 1000
+    pretrain_steps: int = 100_000
     """number of pretraining steps for the world model"""
     seed : int = 42
     """random seed of the experiment"""

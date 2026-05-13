@@ -1,0 +1,209 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=flexible,
+  showstringspaces=false,
+}
+
+\title{SLAC Light--Dark POMDP: Debugging Report}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Starting point}
+
+The codebase contains two main training scripts that implement SLAC (Stochastic
+Latent Actor--Critic) with C51 distributional Q-learning for a partially
+observable light--dark navigation task:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{SLAC\_light\_dark\_POMDP\_C51\_MI\_old\_working.py} --- the
+        reference implementation that converges: world-model loss reaches
+        $\sim 10^{-4}$ during the main loop, and the agent achieves
+        \texttt{eval/success\_reach\_rate} up to $0.38$ at 500k env steps.
+  \item \texttt{SLAC\_light\_dark\_POMDP\_C51\_MI\_new.py} --- the active
+        development version. At the start of this debugging session it did not
+        learn: \texttt{success\_strict\_rate} stayed at $0$ throughout
+        training, eval return remained near $-1.9$.
+\end{itemize}
+
+Both scripts share the same world-model code
+(\texttt{SLAC\_Agent\_deterministic\_tabular.py}), the same C51 agent
+(\texttt{SLAC\_Agent\_D3QN\_tabular.py}), and the same environment
+(\texttt{envs/Light\_dark\_POMDP\_flags.py}). The architecture is a two-level
+latent hierarchy: \(z_1 \in \mathbb{R}^{32}\) (stochastic, fast-changing) and
+\(z_2 \in \mathbb{R}^{256}\) (effectively deterministic, slow-changing).
+Training proceeds in three phases:
+\begin{enumerate}[leftmargin=*]
+  \item Bootstrap (10k random-action steps).
+  \item World-model pretraining (100k steps): first half MSE-only on the
+        decoder reconstruction; second half adds KL, latent transfer MSE, and
+        pixel transfer MSE.
+  \item Joint world-model and C51 learning (500k env steps) with an
+        information-theoretic intrinsic reward.
+\end{enumerate}
+
+\section{Diagnostic findings}
+
+\subsection{Frozen \texorpdfstring{$z_1$}{z1} standard deviation}
+
+Posterior and prior networks for $z_1$ both initialize with
+$\sigma \approx 1.87$ (from the softplus parameterization). The KL term
+$\mathrm{KL}(q\,\|\,p)$ has gradient that cancels when both distributions have
+identical scale, so the standard deviation does not move. Because the decoder
+can route information through $z_2$ alone (which is high-dimensional and
+quasi-deterministic), the reconstruction MSE term has no incentive to push
+$z_1.\sigma$ down either. The result: $z_1$ carries no information about
+the observation.
+
+\subsection{World-model loss does not recover after the joint phase begins}
+
+Pretraining MSE drops to $\sim 6 \times 10^{-6}$ in the MSE-only first half,
+then jumps abruptly to $\sim 0.19$ when KL, latent transfer MSE, and pixel
+transfer MSE turn on simultaneously, and plateaus at $\sim 0.14$ for the
+remainder of pretraining. In the main loop the world-model loss stays at
+$\sim 0.35$. In contrast, the old working file reaches
+\texttt{train/world\_model\_loss} $\approx 1{-}4 \times 10^{-4}$ in the main
+loop --- roughly three orders of magnitude lower.
+
+\subsection{Latent collapse and flat Q-values}
+
+In the new file:
+\begin{itemize}[leftmargin=*]
+  \item Posterior $z_2$ std collapses to $\sim 5 \times 10^{-3}$ --- $z_2$ is
+        effectively deterministic.
+  \item Per-action Q-value spread \texttt{diag/q\_taken\_std\_mean} stays at
+        $\sim 5 \times 10^{-4}$. The C51 critic cannot differentiate between
+        the 25 discrete actions.
+  \item Mutual-information bonus \texttt{intrinsic/raw\_mean} is
+        $\sim 10^{-5}$. With $z_2$ near-deterministic and the C51 distribution
+        invariant across posterior samples, $I(Z;R\mid a) \approx 0$ as
+        expected.
+\end{itemize}
+
+\section{Changes attempted}
+
+\subsection{NaN crashes in the inference path}
+
+Early runs crashed inside \texttt{latent2\_prior} during the Bayes-filter
+rollout with all-\texttt{NaN} \texttt{loc}. Diagnostics showed weights were
+finite at the moment of failure --- the NaN arose from intermediate-activation
+overflow during a forward pass. Two clamps were added to
+\texttt{MLPCompoundNormalSimo.forward} in
+\texttt{SLAC\_Agent\_deterministic\_tabular.py}:
+\begin{lstlisting}[language=Python]
+x  = x.clamp(min=-30.0, max=30.0)                # input
+loc = out[..., :latent_size].clamp(min=-20, max=20)
+scale_diag = F.softplus(...).clamp(max=2.0) + 1e-5
+\end{lstlisting}
+Combined with a gradient-norm clip on the world-model optimizer, NaN crashes
+stopped. The clip was later raised from $1.0$ to $100$ once measured
+gradient norms during the joint phase ($\sim 0.5$--$1.0$) showed it was
+binding and likely throttling joint-phase recovery; however, even at clip
+$=100$ the world-model loss did not improve.
+
+\subsection{Decoder input}
+
+For some intermediate runs the decoder was forced to reconstruct from $z_1$
+alone (\texttt{z\_2} replaced by zeros), in an attempt to break the
+$z_1$-frozen-std symmetry. This unfroze $z_1$
+($\sigma_{z_1} \approx 0.83$ instead of $1.87$) but introduced inference-time
+drift in $z_2$, causing the NaN crashes mentioned above. The decoder was
+reverted to receive the real $z_2$, matching the old working file.
+
+\subsection{Intrinsic-reward mode}
+
+The new file introduced an
+\texttt{intrinsic\_mode} switch with two new variants:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{posterior\_reduction}: a posterior-entropy-reduction bonus,
+        unbounded; observed \texttt{raw\_mean} $\sim 70$--$90$, which the
+        running auto-scaler crushed to near-zero.
+  \item \texttt{action\_disagreement}: posterior-sample argmax disagreement.
+  \item \texttt{mi\_bonus} (restored): the true mutual information
+        $I(Z;R\mid a) = H(\bar{p}(R\mid z,a)) - \mathbb{E}_z\,H(p(R\mid z,a))$
+        used in the old working file. Bounded by $\log 51 \approx 3.9$ nats.
+\end{itemize}
+The default was switched to \texttt{mi\_bonus} since the old working file uses
+this formulation. With the world-model still broken, however, the MI bonus is
+$\sim 10^{-5}$ regardless --- not a usable signal.
+
+\subsection{Hyperparameters tested}
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{sigma\_dark}: $3.0 \to 2.0$ (matching the old working file's
+        env construction).
+  \item \texttt{latent2\_size}: briefly $256 \to 32$ and reverted to $256$.
+  \item \texttt{world\_model\_update\_frequency}: $32 \to 16$ (matching the
+        old working file's main-loop update cadence).
+\end{itemize}
+
+None of these individually closed the gap.
+
+\section{Where we stand}
+
+The two scripts are nominally near-identical for the pretraining phase:
+\begin{itemize}[leftmargin=*]
+  \item Same imports, same model file, same optimizer, same learning rate
+        ($10^{-4}$), batch size ($128$), sequence length ($8$), latent sizes
+        ($32$ + $256$), pretrain budget ($100{,}000$ steps), seed ($42$).
+  \item Same environment configuration ($\sigma_{\mathrm{dark}}=2.0$,
+        $\sigma_{\mathrm{light}}=0.05$, \texttt{noisy\_goal\_obs=False}).
+  \item Same \texttt{compute\_loss} structure: MSE + adaptive-weighted KL with
+        free bits + $0.1\,\cdot$ \texttt{latent\_tf\_mse} +
+        \texttt{pix\_tf\_mse}.
+\end{itemize}
+The only remaining textual differences in \texttt{compute\_loss} are
+cosmetic, plus a minor \texttt{adaptive\_w} floor change from $0$ to $0.05$
+that does not bind in the observed regime.
+
+Despite this, pretraining outcomes differ by orders of magnitude:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+phase & old working file & new file \\
+\midrule
+end of MSE-only pretrain  & --- (not logged)             & $\sim 6 \times 10^{-6}$ \\
+end of joint pretrain     & low (inferred)               & $\sim 0.14$             \\
+main-loop world model     & $\sim 1\text{--}4 \times 10^{-4}$ & $\sim 0.35$        \\
+\texttt{success\_reach\_rate} @ 500k & $0.32$                       & $0.04$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The new file's main script has $\sim 400$ lines of cumulative uncommitted diff
+from its initial commit, including added diagnostics, the intrinsic-mode
+switch, and assorted refactors. Static inspection has not located a single
+change that explains the world-model divergence. The remaining hypothesis is
+a subtle drift in the main loop body or in a helper that we have not yet
+isolated.
+
+\section{Proposed next step}
+
+Rather than continuing the change-by-change bisection, replace
+\texttt{SLAC\_light\_dark\_POMDP\_C51\_MI\_new.py} with a copy of
+\texttt{SLAC\_light\_dark\_POMDP\_C51\_MI\_old\_working.py} and verify the
+baseline reproduces. Then conservatively re-introduce, one group at a time:
+\begin{enumerate}[leftmargin=*]
+  \item the \texttt{intrinsic\_mode} switch and the \texttt{mi\_bonus} branch
+        using the pre-existing \texttt{compute\_mi\_bonus},
+  \item pretrain wandb logging,
+  \item the \texttt{diag/*} diagnostic computations.
+\end{enumerate}
+After each re-introduction, run end-to-end and confirm
+\texttt{train/world\_model\_loss} reaches $\sim 10^{-4}$ in the main loop
+before adding the next group.
+
+\end{document}
