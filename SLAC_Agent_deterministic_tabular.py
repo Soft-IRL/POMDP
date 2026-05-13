@@ -37,6 +37,7 @@ class MultivariateNormalDiag(nn.Module):
             x = torch.cat(inputs, dim=-1)
         else:
             x = inputs[0]
+        x = x.clamp(min=-30.0, max=30.0)
 
         x = F.leaky_relu(self.fc1(x))
         #stats(x, "after fc1")             # <--- add this
@@ -44,8 +45,8 @@ class MultivariateNormalDiag(nn.Module):
         #stats(x, "after fc2")             # <--- and this
         out = self.output_layer(x)
 
-        loc = out[..., :self.latent_size]
-        scale_diag = F.softplus(out[..., self.latent_size:]) + 1e-5  # ensure positivity
+        loc = out[..., :self.latent_size].clamp(min=-20.0, max=20.0)
+        scale_diag = F.softplus(out[..., self.latent_size:]).clamp(max=2.0) + 1e-5
 
         base  = Normal(loc, scale_diag)
         return Independent(base, 1)               # diagonal Gaussian

@@ -41,14 +41,14 @@ class Args:
     """if toggled, the trained model will be saved to disk"""
     from_scratch: bool = True
     """if toggled, the model will be trained from scratch"""
-    ckpt_path = "checkpoints//lightDarkNavigation_POMDP//pretrained_model_randomtarget_nocue.pth"
+    ckpt_path = "checkpoints//lightDarkNavigation_POMDP//pretrained_model_fixedtarget_nocue.pth"
     """If not from scratch, path to the pretrained model"""
 
     env_id: str = "LightDarkNavigation-v0"
     """the id of the environment"""
-    sigma_dark: float = 2.0
+    sigma_dark = 0.0
     """the standard deviation of the dark region noise"""
-    sigma_light: float = 0.05
+    sigma_light = 0.0
     """the standard deviation of the light region noise"""
 
     # Algorithm specific arguments
@@ -82,7 +82,7 @@ class Args:
     """the frequency of training"""
     target_network_frequency: int = 1000
     """the frequency of target network update"""
-    world_model_update_frequency: int = 32
+    world_model_update_frequency: int = 16
     """the frequency of world model update (in gradient steps, not env steps)"""
     tau: float = 0.005
     """the polyak averaging factor for target network update"""
@@ -112,14 +112,12 @@ class Args:
     """Maximum value of the support for C51."""
 
     # ========= Mutual-information intrinsic bonus =========
-    mi_use: bool = True
+    mi_use: bool = False
     """If toggled, adds MI-based intrinsic reward."""
     mi_num_samples: int = 4
     """Posterior samples per timestep for MI estimation."""
-    #mi_beta: float = 0.5
-    #"""Weight of MI bonus added to env reward: r_total_{t+1}=r_env_{t+1}+mi_beta*MI_t."""
-    mi_target_ratio: float = 0.1
-    """Target ratio of MI bonus to env reward: E[mi_bonus] ≈ mi_target_ratio * E[r_env]. Used for automatic scaling."""
+    mi_beta: float = 0.1
+    """Weight of MI bonus added to env reward: r_total_{t+1}=r_env_{t+1}+mi_beta*MI_t."""
     mi_norm_eps: float = 1e-8
     """epsilon for MI normalization"""
 
@@ -129,36 +127,11 @@ class Args:
     mi_center: bool = True
     """whether to subtract batch mean from MI bonus before scaling"""
 
-    diag_use: bool = True
-    """Enable posterior / critic sensitivity diagnostics."""
-    diag_num_samples: int = 8
-    """Number of posterior samples K used for diagnostics."""
-    diag_every: int = 500
-    """Log diagnostics every this many global steps."""
-
-    intrinsic_mode: str = "mi_bonus"
-    """one of: none, mi_bonus, posterior_reduction, action_disagreement"""
-
-    intrinsic_beta: float = 0.1
-    """weight of intrinsic bonus"""
-
-    intrinsic_clip_value: float = 2.0
-    """clip value for centered intrinsic reward"""
-
-    intrinsic_num_samples: int = 8
-    """number of posterior samples for action-disagreement bonus"""
-
-    intrinsic_use_running_scale: bool = True
-    """auto-scale intrinsic reward relative to env reward"""
-
-    intrinsic_target_ratio: float = 0.1
-    """target |intrinsic| / |env reward| ratio when auto-scaling"""
-
 
     # Logging
     track: bool = True
     """If toggled, logs metrics & videos to Weights & Biases."""
-    wandb_project_name: str = "light-dark-slac_POMDP"
+    wandb_project_name: str = "light-dark-slac_POMDP_fixedtarget_nocue"
     """W&B project name"""
     wandb_entity: str | None = None
     """W&B entity (team/user). None = default."""
@@ -615,28 +588,27 @@ def compute_loss(model, images, actions, step_types, step=None, rewards=None, di
     output = {"mse": mse}
 
     if use_kl:
-        p_z1, p_z2, p_z1_auto, p_z2_auto = model.get_prior(z1_post, z2_post, actions, step_types)
+        p_z1, p_z2, p_z1_auto, p_z2_auto = model.get_prior(z1_post, z2_post, actions, step_types) # For every t=0…T−1: pψ(zt+1∣zt2,at) and pψ(zt+12∣zt+1,zt2,at)
+        kl_z1 = kl_divergence(q_z1.dists, p_z1.dists).sum(-1)
 
         q1 = q_z1.dists.base_dist
         p1 = p_z1.dists.base_dist
-        tau = 0.02
-        alpha = 0.8
-        # Learned-prior KL with KL balancing.
-        # Now safe because z2 is zeroed in the decoder, forcing z1 to carry obs info via
-        # reconstruction gradient. The "frozen std" pathology required z1 to be ignored by
-        # the decoder; with z2=0 the symmetry is broken and q_z1.μ is pushed to encode obs.
-        # The learned prior only penalizes innovation (deviation from predicted), not
-        # absolute scale, so z1 is free to be informative without being collapsed to N(0,1).
+
+        # KL balancing + free bits
+        tau = 0.02; alpha = 0.8
         p1_det = torch.distributions.Normal(p1.loc.detach(), p1.scale.detach())
         q1_det = torch.distributions.Normal(q1.loc.detach(), q1.scale.detach())
-        kl_q_raw = torch.distributions.kl_divergence(q1, p1_det)
+
+        kl_q_raw = torch.distributions.kl_divergence(q1, p1_det)          # (B,T+1,D)
         kl_p_raw = torch.distributions.kl_divergence(q1_det, p1)
-        kl_q = (kl_q_raw - tau).clamp_min(0).sum(-1).mean()
+
+        kl_q = (kl_q_raw - tau).clamp_min(0).sum(-1).mean()               # scalar
         kl_p = (kl_p_raw - tau).clamp_min(0).sum(-1).mean()
+
         kl_bal = alpha * kl_q + (1 - alpha) * kl_p
-        target = 0.2
-        adaptive_w = (target * mse.detach() / (kl_bal.detach() + 1e-8)).clamp_(0.05, 1.0)
-        kl_term = adaptive_w * kl_bal
+        target = 0.2  # aim each auxiliary to be ~20% of recon
+        kl_term   = (target * mse.detach() / (kl_bal.detach() + 1e-8)).clamp_(0, 1.0) * kl_bal
+        #pred_term = (target * mse.detach() / (pred_loss.detach() + 1e-8)).clamp_(0, 1.0) * pred_loss
 
 
         # ----- 2) One-step prior consistency (GT inputs → predict t+1) ------------
@@ -652,11 +624,13 @@ def compute_loss(model, images, actions, step_types, step=None, rewards=None, di
         
         latent_tf_mse = ((mu1 - z1_next)**2).mean() + ((mu2 - z2_next)**2).mean()
 
-        x_pred_next = model.decoder(mu1, mu2)
+        # Pixel one-step (decode predicted latents vs x_{t+1})
+        x_pred_next = model.decoder(mu1, mu2)                      # (B,T,1,H,W)
         pix_tf_mse  = ((images[:, 1:] - x_pred_next) ** 2).mean()
 
         loss = mse + kl_term + 0.1*latent_tf_mse + pix_tf_mse
 
+        output["kl_z1"] = kl_z1.mean()
         output["kl_q_raw"] = kl_q_raw.mean()
         output["kl_q"] = kl_q
         output["kl_term"] = kl_term
@@ -946,607 +920,7 @@ def evaluate_policy_deterministic(
 
     return returns, steps_list, successes_strict, successes_reach, video, metrics
 
-@torch.no_grad()
-def compute_uncertainty_diagnostics(
-    agent,
-    q_z1,
-    q_z2,
-    actions,
-    num_samples: int,
-):
-    """
-    Diagnostics for posterior spread, latent dispersion, and critic sensitivity.
 
-    Inputs
-    ------
-    q_z1, q_z2:
-        Posterior distribution containers returned by Model.sample_posterior(...)
-        Must have .dists with rsample() and base_dist.scale
-    actions:
-        Tensor of shape (B, S), discrete actions from replay
-    num_samples:
-        K posterior samples
-
-    Returns
-    -------
-    dict[str, torch.Tensor scalar]
-    """
-    device = actions.device
-    K = num_samples
-    B, S = actions.shape
-    T = S - 1
-    BT = B * T
-
-    # ------------------------------------------------------------
-    # A) posterior spread directly
-    # ------------------------------------------------------------
-    # q_z?.dists.base_dist.scale expected shape: (B, S, Dz)
-    std_z1 = q_z1.dists.base_dist.scale
-    std_z2 = q_z2.dists.base_dist.scale
-
-    post_z1_std_mean = std_z1.mean()
-    post_z2_std_mean = std_z2.mean()
-
-    post_z1_var_mean = (std_z1 ** 2).mean()
-    post_z2_var_mean = (std_z2 ** 2).mean()
-
-    # ------------------------------------------------------------
-    # Sample K posterior latent trajectories
-    # Shapes:
-    #   z1_samples: (K, B, S, D1)
-    #   z2_samples: (K, B, S, D2)
-    # ------------------------------------------------------------
-    z1_samples = q_z1.dists.rsample((K,))
-    z2_samples = q_z2.dists.rsample((K,))
-
-    # current transition latents only: t = 0..T-1
-    z1_t = z1_samples[:, :, :-1, :]   # (K, B, T, D1)
-    z2_t = z2_samples[:, :, :-1, :]   # (K, B, T, D2)
-    z_t = torch.cat([z1_t, z2_t], dim=-1)  # (K, B, T, D)
-
-    D = z_t.shape[-1]
-
-    # flatten transitions
-    z_flat = z_t.reshape(K, BT, D)    # (K, BT, D)
-
-    # ------------------------------------------------------------
-    # B) latent sample dispersion
-    # mean pairwise distance across samples for each transition
-    # ------------------------------------------------------------
-    # distances between all sample pairs
-    # diff: (K, K, BT, D)
-    diff = z_flat[:, None, :, :] - z_flat[None, :, :, :]
-    pairwise_dist = torch.norm(diff, dim=-1)  # (K, K, BT)
-
-    # use upper triangle only, exclude diagonal
-    tri_i, tri_j = torch.triu_indices(K, K, offset=1, device=device)
-    pairwise_dist_ut = pairwise_dist[tri_i, tri_j]  # (#pairs, BT)
-
-    latent_pairwise_dist_mean = pairwise_dist_ut.mean()
-
-    # ------------------------------------------------------------
-    # C) critic sensitivity to latent samples
-    # ------------------------------------------------------------
-    # taken actions aligned with t = 0..T-1
-    a_t = actions[:, :-1].reshape(BT)  # (BT,)
-    idx_bt = torch.arange(BT, device=device)
-
-    q_taken_list = []
-    p_taken_list = []
-    logits_taken_list = []
-
-    # critic support for expected-Q computation
-    support = agent.atoms.to(device)  # shape: (N_atoms,)
-
-    for k in range(K):
-        zk = z_flat[k]  # (BT, D)
-        zk = F.layer_norm(zk, zk.shape[-1:])
-
-        logits = agent._logits(zk)             # (BT, A, N_atoms)
-        probs = logits.softmax(dim=-1)         # (BT, A, N_atoms)
-
-        logits_taken = logits[idx_bt, a_t]     # (BT, N_atoms)
-        probs_taken = probs[idx_bt, a_t]       # (BT, N_atoms)
-
-        # scalar expected Q for taken action
-        q_taken = (probs_taken * support.unsqueeze(0)).sum(dim=-1)  # (BT,)
-
-        logits_taken_list.append(logits_taken)
-        p_taken_list.append(probs_taken)
-        q_taken_list.append(q_taken)
-
-    # stack over K
-    logits_taken_stack = torch.stack(logits_taken_list, dim=0)  # (K, BT, N_atoms)
-    p_taken_stack = torch.stack(p_taken_list, dim=0)            # (K, BT, N_atoms)
-    q_taken_stack = torch.stack(q_taken_list, dim=0)            # (K, BT)
-
-    # requested diagnostic:
-    # std across k of Q_k(a) for the taken action
-    q_taken_std_across_k = q_taken_stack.std(dim=0, unbiased=False)  # (BT,)
-    q_taken_std_mean = q_taken_std_across_k.mean()
-
-    # variance / std of probs and logits across posterior samples
-    probs_std_across_k = p_taken_stack.std(dim=0, unbiased=False)     # (BT, N_atoms)
-    logits_std_across_k = logits_taken_stack.std(dim=0, unbiased=False)
-
-    probs_std_mean = probs_std_across_k.mean()
-    logits_std_mean = logits_std_across_k.mean()
-
-    return {
-        "post_z1_std_mean": post_z1_std_mean,
-        "post_z2_std_mean": post_z2_std_mean,
-        "post_z1_var_mean": post_z1_var_mean,
-        "post_z2_var_mean": post_z2_var_mean,
-        "latent_pairwise_dist_mean": latent_pairwise_dist_mean,
-        "q_taken_std_mean": q_taken_std_mean,
-        "probs_std_mean": probs_std_mean,
-        "logits_std_mean": logits_std_mean,
-    }
-
-@torch.no_grad()
-def compute_relative_uncertainty_diagnostics(
-    agent,
-    q_z1,
-    q_z2,
-    actions,
-    num_samples: int,
-    eps: float = 1e-8,
-):
-    """
-    Relative diagnostics:
-      1) posterior std relative to latent mean magnitude
-      2) posterior sample dispersion relative to latent norm
-      3) value sensitivity relative to value magnitude
-
-    Returns dict[str, torch.Tensor scalar]
-    """
-    device = actions.device
-    K = num_samples
-    B, S = actions.shape
-    T = S - 1
-    BT = B * T
-
-    # ------------------------------------------------------------
-    # 1) posterior std relative to latent mean magnitude
-    # ------------------------------------------------------------
-    base1 = q_z1.dists.base_dist
-    base2 = q_z2.dists.base_dist
-
-    mu_z1 = base1.loc      # (B, S, D1)
-    std_z1 = base1.scale   # (B, S, D1)
-    mu_z2 = base2.loc      # (B, S, D2)
-    std_z2 = base2.scale   # (B, S, D2)
-
-    rel_post_z1_std = std_z1.mean() / (mu_z1.abs().mean() + eps)
-    rel_post_z2_std = std_z2.mean() / (mu_z2.abs().mean() + eps)
-
-    # ------------------------------------------------------------
-    # sample K posterior latent trajectories
-    # ------------------------------------------------------------
-    z1_samples = q_z1.dists.rsample((K,))   # (K, B, S, D1)
-    z2_samples = q_z2.dists.rsample((K,))   # (K, B, S, D2)
-
-    z1_t = z1_samples[:, :, :-1, :]         # (K, B, T, D1)
-    z2_t = z2_samples[:, :, :-1, :]         # (K, B, T, D2)
-    z_t = torch.cat([z1_t, z2_t], dim=-1)   # (K, B, T, D)
-
-    D = z_t.shape[-1]
-    z_flat = z_t.reshape(K, BT, D)          # (K, BT, D)
-
-    # posterior mean latent for current transitions
-    mu_t = torch.cat([mu_z1[:, :-1, :], mu_z2[:, :-1, :]], dim=-1)  # (B, T, D)
-    mu_t_flat = mu_t.reshape(BT, D)                                  # (BT, D)
-
-    # ------------------------------------------------------------
-    # 2) posterior sample dispersion relative to latent norm
-    # ------------------------------------------------------------
-    diff = z_flat[:, None, :, :] - z_flat[None, :, :, :]   # (K, K, BT, D)
-    pairwise_dist = torch.norm(diff, dim=-1)               # (K, K, BT)
-
-    tri_i, tri_j = torch.triu_indices(K, K, offset=1, device=device)
-    pairwise_dist_ut = pairwise_dist[tri_i, tri_j]         # (#pairs, BT)
-
-    pairwise_dist_mean = pairwise_dist_ut.mean()
-    latent_norm_mean = torch.norm(mu_t_flat, dim=-1).mean()
-
-    rel_latent_pairwise_dist = pairwise_dist_mean / (latent_norm_mean + eps)
-
-    # ------------------------------------------------------------
-    # 3) value sensitivity relative to value magnitude
-    #    for the taken action
-    # ------------------------------------------------------------
-    a_t = actions[:, :-1].reshape(BT)  # (BT,)
-    idx_bt = torch.arange(BT, device=device)
-
-    support = agent.atoms.to(device)   # (N_atoms,)
-
-    q_taken_list = []
-    for k in range(K):
-        zk = z_flat[k]                                  # (BT, D)
-        zk = F.layer_norm(zk, zk.shape[-1:])
-
-        logits = agent._logits(zk)                      # (BT, A, N_atoms)
-        probs = logits.softmax(dim=-1)                 # (BT, A, N_atoms)
-        probs_taken = probs[idx_bt, a_t]               # (BT, N_atoms)
-
-        q_taken = (probs_taken * support.unsqueeze(0)).sum(dim=-1)  # (BT,)
-        q_taken_list.append(q_taken)
-
-    q_taken_stack = torch.stack(q_taken_list, dim=0)   # (K, BT)
-
-    q_taken_std = q_taken_stack.std(dim=0, unbiased=False)          # (BT,)
-    q_taken_abs_mean = q_taken_stack.abs().mean(dim=0)              # (BT,)
-
-    q_taken_std_mean = q_taken_std.mean()
-    q_taken_abs_mean_global = q_taken_abs_mean.mean()
-
-    rel_q_taken_std = q_taken_std_mean / (q_taken_abs_mean_global + eps)
-
-    return {
-        "rel_post_z1_std": rel_post_z1_std,
-        "rel_post_z2_std": rel_post_z2_std,
-        "rel_latent_pairwise_dist": rel_latent_pairwise_dist,
-        "rel_q_taken_std": rel_q_taken_std,
-        "q_taken_abs_mean": q_taken_abs_mean_global,
-    }
-
-@torch.no_grad()
-def compute_all_action_uncertainty_diagnostics(
-    agent,
-    q_z1,
-    q_z2,
-    num_samples: int,
-    eps: float = 1e-8,
-):
-    """
-    Measure uncertainty sensitivity across ALL actions, not only the taken one.
-
-    Returns scalar diagnostics:
-      - mean std of expected Q across posterior samples, averaged over actions/states
-      - mean max std across actions
-      - std of best-action value across posterior samples
-      - argmax action disagreement rate across posterior samples
-    """
-    device = q_z1.dists.base_dist.loc.device
-    K = num_samples
-
-    # posterior samples
-    z1_samples = q_z1.dists.rsample((K,))   # (K, B, S, D1)
-    z2_samples = q_z2.dists.rsample((K,))   # (K, B, S, D2)
-
-    # current transitions only: t = 0..T-1
-    z1_t = z1_samples[:, :, :-1, :]         # (K, B, T, D1)
-    z2_t = z2_samples[:, :, :-1, :]         # (K, B, T, D2)
-    z_t = torch.cat([z1_t, z2_t], dim=-1)   # (K, B, T, D)
-
-    K, B, T, D = z_t.shape
-    BT = B * T
-
-    support = agent.atoms.to(device)        # (N_atoms,)
-
-    q_all_list = []
-    argmax_list = []
-
-    for k in range(K):
-        zk = z_t[k].reshape(BT, D)                          # (BT, D)
-        zk = F.layer_norm(zk, zk.shape[-1:])
-
-        logits = agent._logits(zk)                          # (BT, A, N_atoms)
-        probs = logits.softmax(dim=-1)                     # (BT, A, N_atoms)
-
-        # expected Q for all actions
-        q_all = (probs * support.view(1, 1, -1)).sum(dim=-1)   # (BT, A)
-
-        q_all_list.append(q_all)
-        argmax_list.append(q_all.argmax(dim=-1))           # (BT,)
-
-    # stack over posterior samples
-    q_all_stack = torch.stack(q_all_list, dim=0)           # (K, BT, A)
-    argmax_stack = torch.stack(argmax_list, dim=0)         # (K, BT)
-
-    # ------------------------------------------------------------
-    # 1) std across posterior samples for each action
-    # ------------------------------------------------------------
-    q_std_across_k = q_all_stack.std(dim=0, unbiased=False)    # (BT, A)
-
-    # average over actions and states
-    q_all_actions_std_mean = q_std_across_k.mean()
-
-    # for each state, take the action with largest std, then average states
-    q_max_action_std_mean = q_std_across_k.max(dim=-1).values.mean()
-
-    # relative versions
-    q_abs_mean = q_all_stack.abs().mean(dim=0)                 # (BT, A)
-    rel_q_std = q_std_across_k / (q_abs_mean + eps)            # (BT, A)
-
-    rel_q_all_actions_std_mean = rel_q_std.mean()
-    rel_q_max_action_std_mean = rel_q_std.max(dim=-1).values.mean()
-
-    # ------------------------------------------------------------
-    # 2) std of best-action value across posterior samples
-    # ------------------------------------------------------------
-    best_q_each_k = q_all_stack.max(dim=-1).values             # (K, BT)
-    best_q_std_mean = best_q_each_k.std(dim=0, unbiased=False).mean()
-
-    best_q_abs_mean = best_q_each_k.abs().mean(dim=0).mean()
-    rel_best_q_std_mean = best_q_std_mean / (best_q_abs_mean + eps)
-
-    # ------------------------------------------------------------
-    # 3) argmax action disagreement across posterior samples
-    # ------------------------------------------------------------
-    # For each state BT, how often do sampled argmax actions disagree?
-    # Compute fraction not equal to modal action.
-    disagreement_rates = []
-    for bt in range(BT):
-        acts = argmax_stack[:, bt]  # (K,)
-        values, counts = acts.unique(return_counts=True)
-        modal_count = counts.max()
-        disagreement = 1.0 - (modal_count.float() / K)
-        disagreement_rates.append(disagreement)
-
-    argmax_disagreement_mean = torch.stack(disagreement_rates).mean()
-
-    return {
-        "q_all_actions_std_mean": q_all_actions_std_mean,
-        "q_max_action_std_mean": q_max_action_std_mean,
-        "rel_q_all_actions_std_mean": rel_q_all_actions_std_mean,
-        "rel_q_max_action_std_mean": rel_q_max_action_std_mean,
-        "best_q_std_mean": best_q_std_mean,
-        "rel_best_q_std_mean": rel_best_q_std_mean,
-        "argmax_disagreement_mean": argmax_disagreement_mean,
-    }
-
-@torch.no_grad()
-def posterior_entropy_per_timestep(q_z1, q_z2):
-    """
-    Returns total posterior entropy per timestep.
-    Output shape: (B, S)
-    """
-    H1 = q_z1.dists.entropy()
-    H2 = q_z2.dists.entropy()
-
-    # If entropy returns per-dimension values, sum over latent dim
-    if H1.ndim == 3:
-        H1 = H1.sum(dim=-1)
-    if H2.ndim == 3:
-        H2 = H2.sum(dim=-1)
-
-    return H1 + H2
-
-@torch.no_grad()
-def compute_posterior_reduction_bonus(q_z1, q_z2):
-    """
-    r_t^info = H(q_t) - H(q_{t+1})
-    aligned to transitions t=0..S-2, to be added to rewards[:,1:].
-    Output shape: (B, S-1)
-    """
-    H = posterior_entropy_per_timestep(q_z1, q_z2)   # (B, S)
-    bonus = H[:, :-1] - H[:, 1:]                     # (B, S-1)
-    return bonus
-
-@torch.no_grad()
-def compute_action_disagreement_bonus(agent, q_z1, q_z2, num_samples: int):
-    """
-    For each transition t, sample K posterior latents, compute greedy action under each,
-    and reward disagreement across samples.
-
-    Output shape: (B, S-1)
-    """
-    device = q_z1.dists.base_dist.loc.device
-    K = num_samples
-
-    z1_samples = q_z1.dists.rsample((K,))   # (K, B, S, D1)
-    z2_samples = q_z2.dists.rsample((K,))   # (K, B, S, D2)
-
-    z1_t = z1_samples[:, :, :-1, :]
-    z2_t = z2_samples[:, :, :-1, :]
-    z_t = torch.cat([z1_t, z2_t], dim=-1)   # (K, B, S-1, D)
-
-    K, B, T, D = z_t.shape
-    BT = B * T
-
-    argmax_list = []
-
-    for k in range(K):
-        zk = z_t[k].reshape(BT, D)
-        zk = F.layer_norm(zk, zk.shape[-1:])
-
-        logits = agent._logits(zk)                      # (BT, A, N_atoms)
-        probs = logits.softmax(dim=-1)                 # (BT, A, N_atoms)
-        q_all = (probs * agent.atoms.to(device).view(1, 1, -1)).sum(dim=-1)  # (BT, A)
-
-        argmax_list.append(q_all.argmax(dim=-1))       # (BT,)
-
-    argmax_stack = torch.stack(argmax_list, dim=0)     # (K, BT)
-
-    disagreement = []
-    for bt in range(BT):
-        acts = argmax_stack[:, bt]
-        _, counts = acts.unique(return_counts=True)
-        modal_count = counts.max()
-        dis = 1.0 - (modal_count.float() / K)
-        disagreement.append(dis)
-
-    disagreement = torch.stack(disagreement).view(B, T)   # (B, S-1)
-    return disagreement
-
-class RunningMean:
-    """Exponential moving average of a scalar — used as a model-agnostic baseline."""
-    def __init__(self, momentum: float = 0.99):
-        self.momentum = momentum
-        self.value: float | None = None
-
-    def update(self, x: torch.Tensor) -> torch.Tensor:
-        batch_mean = x.mean().item()
-        if self.value is None:
-            self.value = batch_mean
-        else:
-            self.value = self.momentum * self.value + (1.0 - self.momentum) * batch_mean
-        return torch.tensor(self.value, dtype=x.dtype, device=x.device)
-
-@torch.no_grad()
-def scale_intrinsic_reward(raw_bonus, rewards, baseline, target_ratio=0.1, clip_value=2.0):
-    """
-    Correct normalization order:
-      1. subtract baseline (e.g. out->out mean ΔH, computed by caller)
-      2. divide by batch std
-      3. clip
-      4. auto-scale to target_ratio * |env_reward|
-
-    raw_bonus : (B, S-1)
-    rewards   : (B, S)
-    baseline  : scalar tensor — subtracted before normalizing
-    """
-    # --- 1. subtract baseline, normalize by std ---
-    bonus_centered = raw_bonus - baseline
-    bonus_std = bonus_centered.std(unbiased=False).clamp(min=1e-8)
-    bonus_normed = bonus_centered / bonus_std
-
-    # --- 2. clip ---
-    bonus_clipped = torch.clamp(bonus_normed, -clip_value, clip_value)
-
-    # --- 3. auto-scale to target_ratio * |env_reward| ---
-    env_abs_mean   = rewards[:, 1:].abs().mean()
-    bonus_abs_mean = bonus_clipped.abs().mean()
-    auto_beta = target_ratio * env_abs_mean / (bonus_abs_mean + 1e-8)
-    auto_beta = torch.clamp(auto_beta, 0.0, 100.0)
-
-    bonus_scaled = auto_beta * bonus_clipped
-
-    stats = {
-        "raw_mean":        raw_bonus.mean(),
-        "raw_std":         raw_bonus.std(unbiased=False),
-        "baseline":        baseline,
-        "scaled_mean":     bonus_scaled.mean(),
-        "scaled_std":      bonus_scaled.std(unbiased=False),
-        "scaled_abs_mean": bonus_scaled.abs().mean(),
-        "scaled_max_abs":  bonus_scaled.abs().max(),
-        "auto_beta":       auto_beta,
-    }
-    return bonus_scaled, stats
-
-@torch.no_grad()
-def compute_band_entropy_reduction_diagnostics(q_z1, q_z2, images, world_radius, band_center_x, band_width):
-    """
-    Compute entropy reduction diagnostics split by band transition type.
-
-    Assumptions:
-    - tabular observation
-    - first two dims of observation are current position (x, y)
-    - images were normalized by / world_radius before being passed in
-    - band is a vertical strip centered at band_center_x with width band_width
-
-    Returns dict of scalar tensors:
-      - H_mean
-      - dH_mean
-      - dH_out_out
-      - dH_out_in
-      - dH_in_in
-      - dH_in_out
-      - frac_out_out
-      - frac_out_in
-      - frac_in_in
-      - frac_in_out
-    """
-    device = images.device
-
-    # ------------------------------------------------------------
-    # posterior entropy per timestep: shape (B, S)
-    # ------------------------------------------------------------
-    H = posterior_entropy_per_timestep(q_z1, q_z2)   # (B, S)
-    dH = H[:, :-1] - H[:, 1:]                        # (B, S-1)
-
-    # ------------------------------------------------------------
-    # recover x-position from normalized observations
-    # images shape assumed (B, S, obs_dim) or (B, S, 1, obs_dim)
-    # your code uses obs shape (1, obs_dim) in replay, so handle both
-    # ------------------------------------------------------------
-    obs = images
-    if obs.ndim == 4:
-        # (B, S, 1, obs_dim) -> (B, S, obs_dim)
-        obs = obs.squeeze(2)
-
-    x_t = obs[:, :-1, 0] * world_radius     # (B, S-1)
-    x_tp1 = obs[:, 1:, 0] * world_radius    # (B, S-1)
-
-    half_w = band_width / 2.0
-    in_t = (x_t >= (band_center_x - half_w)) & (x_t <= (band_center_x + half_w))
-    in_tp1 = (x_tp1 >= (band_center_x - half_w)) & (x_tp1 <= (band_center_x + half_w))
-
-    mask_out_out = (~in_t) & (~in_tp1)
-    mask_out_in  = (~in_t) & ( in_tp1)
-    mask_in_in   = ( in_t) & ( in_tp1)
-    mask_in_out  = ( in_t) & (~in_tp1)
-
-    def masked_mean(x, mask):
-        if mask.any():
-            return x[mask].mean()
-        return torch.tensor(float("nan"), device=device)
-
-    total = dH.numel()
-    frac_out_out = mask_out_out.float().sum() / total
-    frac_out_in  = mask_out_in.float().sum() / total
-    frac_in_in   = mask_in_in.float().sum() / total
-    frac_in_out  = mask_in_out.float().sum() / total
-
-    return {
-        "H_mean": H.mean(),
-        "dH_mean": dH.mean(),
-        "dH_out_out": masked_mean(dH, mask_out_out),
-        "dH_out_in": masked_mean(dH, mask_out_in),
-        "dH_in_in": masked_mean(dH, mask_in_in),
-        "dH_in_out": masked_mean(dH, mask_in_out),
-        "frac_out_out": frac_out_out,
-        "frac_out_in": frac_out_in,
-        "frac_in_in": frac_in_in,
-        "frac_in_out": frac_in_out,
-    }
-
-@torch.no_grad()
-def compute_band_bonus_diagnostics(raw_bonus, images, world_radius, band_center_x, band_width):
-    """
-    Split any transition-level bonus (shape B x (S-1)) by band transition type.
-
-    Inputs
-    ------
-    raw_bonus : (B, S-1)
-        Transition-aligned intrinsic bonus before or after scaling.
-    images : normalized observations used in training batch
-    world_radius : scaling used to normalize observations
-
-    Assumes first obs dimension is x-position.
-    """
-    device = raw_bonus.device
-
-    obs = images
-    if obs.ndim == 4:
-        obs = obs.squeeze(2)   # (B,S,obs_dim)
-
-    x_t = obs[:, :-1, 0] * world_radius
-    x_tp1 = obs[:, 1:, 0] * world_radius
-
-    half_w = band_width / 2.0
-    in_t = (x_t >= (band_center_x - half_w)) & (x_t <= (band_center_x + half_w))
-    in_tp1 = (x_tp1 >= (band_center_x - half_w)) & (x_tp1 <= (band_center_x + half_w))
-
-    mask_out_out = (~in_t) & (~in_tp1)
-    mask_out_in  = (~in_t) & ( in_tp1)
-    mask_in_in   = ( in_t) & ( in_tp1)
-    mask_in_out  = ( in_t) & (~in_tp1)
-
-    def masked_mean(x, mask):
-        if mask.any():
-            return x[mask].mean()
-        return torch.tensor(float("nan"), device=device)
-
-    return {
-        "bonus_mean": raw_bonus.mean(),
-        "bonus_abs_mean": raw_bonus.abs().mean(),
-        "bonus_out_out": masked_mean(raw_bonus, mask_out_out),
-        "bonus_out_in": masked_mean(raw_bonus, mask_out_in),
-        "bonus_in_in": masked_mean(raw_bonus, mask_in_in),
-        "bonus_in_out": masked_mean(raw_bonus, mask_in_out),
-    }
 
 if __name__ == '__main__':
     args = tyro.cli(Args)
@@ -1578,7 +952,7 @@ if __name__ == '__main__':
         code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SequenceReplayBuffer.py")
         code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SLAC_Agent_deterministic_tabular.py")
         code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SLAC_Agent_D3QN_tabular.py")
-        code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SLAC_light_dark_POMDP_C51_MI_new.py")
+        code_art.add_file("C:\\Users\\Simo\\Documents\\Python Scripts\\SLAC\\SLAC_light_dark_POMDP_C51_MI.py")
         run.log_artifact(code_art)
 
         # Make W&B use "global_step" as the step axis (avoid wandb.log(step=...))
@@ -1611,8 +985,8 @@ if __name__ == '__main__':
         band_angle_deg=90.0,    # vertical white strip
         band_center=(-8.0 + 2.0/2, 0.0),  # left side
         band_width=2.0,
-        sigma_dark=args.sigma_dark,
-        sigma_light=args.sigma_light,
+        sigma_dark=2.0,
+        sigma_light=0.05,
         # obs composition
         include_goal_in_obs=True,
         noisy_goal_obs=False,
@@ -1626,14 +1000,10 @@ if __name__ == '__main__':
     )
 
 
-    env.unwrapped.cfg.max_steps = args.max_episode_steps
+    env.unwrapped.cfg.max_steps =  args.max_episode_steps
     env = DiscreteActionsEnv2(env, n_levels=5)
     args.obs_kind = "tabular"
     world_radius = env.unwrapped.cfg.world_radius
-    # Read band geometry from env config so it propagates everywhere via args
-    args.world_radius  = world_radius
-    args.band_center_x = float(env.unwrapped.cfg.band_center[0])
-    args.band_width    = float(env.unwrapped.cfg.band_width)
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
@@ -1697,29 +1067,7 @@ if __name__ == '__main__':
                 reconstruction_losses_kl.append(model_loss.item())
             Model.optimizer.zero_grad()
             model_loss.backward()
-            # Diagnostics: catch first NaN/Inf in loss or gradients.
-            if not torch.isfinite(model_loss):
-                print(f"\n[NaN] non-finite LOSS at pretrain_step={pretrain_step}", flush=True)
-                print({k: (float(v) if torch.is_tensor(v) and v.numel()==1 else v) for k, v in output.items()})
-                raise RuntimeError("non-finite loss")
-            for n, p in Model.named_parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    print(f"\n[NaN] non-finite GRAD in {n} at pretrain_step={pretrain_step}, loss={float(model_loss):.4g}", flush=True)
-                    print({k: (float(v) if torch.is_tensor(v) and v.numel()==1 else v) for k, v in output.items()}, flush=True)
-                    raise RuntimeError(f"non-finite grad in {n}")
-            grad_norm = torch.nn.utils.clip_grad_norm_(Model.parameters(), 100.0)
             Model.optimizer.step()
-            for n, p in Model.named_parameters():
-                if not torch.isfinite(p).all():
-                    print(f"\n[NaN] non-finite WEIGHTS in {n} after step at pretrain_step={pretrain_step}, pre-clip grad_norm={float(grad_norm):.4g}, loss={float(model_loss):.4g}", flush=True)
-                    print({k: (float(v) if torch.is_tensor(v) and v.numel()==1 else v) for k, v in output.items()}, flush=True)
-                    raise RuntimeError(f"non-finite weights in {n}")
-            if writer is not None and (pretrain_step % 100 == 0):
-                writer.add_scalar("pretrain/world_model_loss", float(model_loss.item()), pretrain_step)
-                writer.add_scalar("pretrain/grad_norm", float(grad_norm), pretrain_step)
-                for k, v in output.items():
-                    if torch.is_tensor(v) and v.numel() == 1:
-                        writer.add_scalar(f"pretrain/{k}", float(v.item()), pretrain_step)
             #reconstruction_losses.append(model_loss.item())
         if args.save_model:
             path = f"checkpoints\\LightDarkNavigation_POMDP\\{run_name}\\pretrained_model_fixedtarget_nocue.pth"
@@ -1735,7 +1083,6 @@ if __name__ == '__main__':
     ep_return = 0.0
     ep_len = 0
     episodes = 0
-    dH_baseline = RunningMean(momentum=0.99)
 
     #start the game
     # ---- reset & init belief with FIRST posteriors (uses latent1_first_posterior) ----
@@ -1776,7 +1123,7 @@ if __name__ == '__main__':
             z2_t = q2.rsample()
 
             z1_bel, z2_bel = z1_t, z2_t
-
+        
         if random.random() < agent.epsilon:     
             action = torch.as_tensor([env.action_space.sample() for _ in range(args.num_envs)], device=device, dtype=torch.long) 
         else:
@@ -1835,73 +1182,15 @@ if __name__ == '__main__':
                 model_loss, output = compute_loss(Model, images, actions, step_ty, use_kl=True)
                 Model.optimizer.zero_grad()
                 model_loss.backward()
-                if not torch.isfinite(model_loss):
-                    print(f"\n[NaN] non-finite LOSS at global_step={global_step}", flush=True)
-                    print({k: (float(v) if torch.is_tensor(v) and v.numel()==1 else v) for k, v in output.items()}, flush=True)
-                    raise RuntimeError("non-finite loss")
-                for n, p in Model.named_parameters():
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        print(f"\n[NaN] non-finite GRAD in {n} at global_step={global_step}, loss={float(model_loss):.4g}", flush=True)
-                        print({k: (float(v) if torch.is_tensor(v) and v.numel()==1 else v) for k, v in output.items()}, flush=True)
-                        raise RuntimeError(f"non-finite grad in {n}")
-                grad_norm = torch.nn.utils.clip_grad_norm_(Model.parameters(), 100.0)
+                torch.nn.utils.clip_grad_norm_(Model.parameters(), 20.0)
                 Model.optimizer.step()
-                for n, p in Model.named_parameters():
-                    if not torch.isfinite(p).all():
-                        print(f"\n[NaN] non-finite WEIGHTS in {n} after step at global_step={global_step}, pre-clip grad_norm={float(grad_norm):.4g}, loss={float(model_loss):.4g}", flush=True)
-                        print({k: (float(v) if torch.is_tensor(v) and v.numel()==1 else v) for k, v in output.items()}, flush=True)
-                        raise RuntimeError(f"non-finite weights in {n}")
             
             with torch.no_grad():
                 # Posterior latents & posterior distributions
                 (z1, z2), (q_z1, q_z2) = Model.sample_posterior(images, actions, step_ty)
-            
-                band_entropy_stats = None
-                if args.diag_use and (global_step % args.diag_every == 0):
-                    band_entropy_stats = compute_band_entropy_reduction_diagnostics(
-                        q_z1=q_z1,
-                        q_z2=q_z2,
-                        images=images,
-                        world_radius=world_radius,
-                        band_center_x=args.band_center_x,
-                        band_width=args.band_width,
-                    )
 
-            # ------------------------------------------------------------
-            # Optional diagnostics
-            # ------------------------------------------------------------
-                diag_stats = None
-                if args.diag_use and (global_step % args.diag_every == 0):
-                    diag_stats = compute_uncertainty_diagnostics(
-                        agent=agent,
-                        q_z1=q_z1,
-                        q_z2=q_z2,
-                        actions=actions,
-                        num_samples=args.diag_num_samples,
-                    )
-                
-                rel_diag_stats = None
-                if args.diag_use and (global_step % args.diag_every == 0):
-                    rel_diag_stats = compute_relative_uncertainty_diagnostics(
-                        agent=agent,
-                        q_z1=q_z1,
-                        q_z2=q_z2,
-                        actions=actions,
-                        num_samples=args.diag_num_samples,
-                    )
-                
-                all_action_diag_stats = None
-                if args.diag_use and (global_step % args.diag_every == 0):
-                    all_action_diag_stats = compute_all_action_uncertainty_diagnostics(
-                        agent=agent,
-                        q_z1=q_z1,
-                        q_z2=q_z2,
-                        num_samples=args.diag_num_samples,
-                    )
-
-                """# Optional MI bonus (aligned with transitions t=0..S-2, attached to r_{t+1})
-                #if args.mi_use and args.mi_beta > 0.0:
-                if args.mi_use:
+                # Optional MI bonus (aligned with transitions t=0..S-2, attached to r_{t+1})
+                if args.mi_use and args.mi_beta > 0.0:
                     # ------------------------------------------------------------
                     # Test A: compute MI without perturbing the later torch RNG stream
                     # ------------------------------------------------------------
@@ -1927,11 +1216,7 @@ if __name__ == '__main__':
                     # ------------------------------------------------------------
                     mi_centered = mi_bonus - mi_bonus.mean()
                     mi_clip = torch.clamp(mi_centered, -args.mi_clip_value, args.mi_clip_value)
-                    env_abs_mean = rewards[:, 1:].abs().mean()
-                    mi_abs_mean = mi_clip.abs().mean()
-                    auto_beta = args.mi_target_ratio * env_abs_mean / (mi_abs_mean + 1e-8)
-                    mi_shaped = auto_beta * mi_clip
-                    #mi_shaped = args.mi_beta * mi_clip
+                    mi_shaped = args.mi_beta * mi_clip
                     #mi_shaped_0 = 0.0
 
                     rewards_total = rewards.clone()
@@ -1955,112 +1240,7 @@ if __name__ == '__main__':
                     mi_to_env_ratio = mi_shaped_abs_mean / (env_reward_abs_mean + 1e-8)
 
                 else:
-                    rewards_total = rewards"""
-                
-                # ------------------------------------------------------------
-                # intrinsic reward block
-                # ------------------------------------------------------------
-                raw_bonus = None
-                intrinsic_bonus = None
-                intrinsic_stats = None
-                bonus_band_stats_raw = None
-                bonus_band_stats_scaled = None
-
-                _band_center_x = args.band_center_x
-                _band_width    = args.band_width
-
-                if args.intrinsic_mode == "mi_bonus":
-                    raw_bonus = compute_mi_bonus(
-                        agent=agent,
-                        q_z1=q_z1,
-                        q_z2=q_z2,
-                        actions=actions,
-                        step_types=step_ty,
-                        mi_num_samples=args.mi_num_samples,
-                    )
-
-                    if args.intrinsic_use_running_scale:
-                        baseline = dH_baseline.update(raw_bonus)
-                        bonus_scaled, intrinsic_stats = scale_intrinsic_reward(
-                            raw_bonus,
-                            rewards,
-                            baseline=baseline,
-                            target_ratio=args.intrinsic_target_ratio,
-                            clip_value=args.intrinsic_clip_value,
-                        )
-                        intrinsic_bonus = bonus_scaled
-                    else:
-                        bonus_centered = raw_bonus - raw_bonus.mean()
-                        bonus_clipped = torch.clamp(bonus_centered, -args.intrinsic_clip_value, args.intrinsic_clip_value)
-                        intrinsic_bonus = args.intrinsic_beta * bonus_clipped
-
-                elif args.intrinsic_mode == "posterior_reduction":
-                    raw_bonus = compute_posterior_reduction_bonus(q_z1, q_z2)
-
-                    if args.intrinsic_use_running_scale:
-                        baseline = dH_baseline.update(raw_bonus)
-                        bonus_scaled, intrinsic_stats = scale_intrinsic_reward(
-                            raw_bonus,
-                            rewards,
-                            baseline=baseline,
-                            target_ratio=args.intrinsic_target_ratio,
-                            clip_value=args.intrinsic_clip_value,
-                        )
-                        intrinsic_bonus = bonus_scaled
-                    else:
-                        bonus_centered = raw_bonus - raw_bonus.mean()
-                        bonus_clipped = torch.clamp(bonus_centered, -args.intrinsic_clip_value, args.intrinsic_clip_value)
-                        intrinsic_bonus = args.intrinsic_beta * bonus_clipped
-
-                elif args.intrinsic_mode == "action_disagreement":
-                    raw_bonus = compute_action_disagreement_bonus(
-                        agent=agent,
-                        q_z1=q_z1,
-                        q_z2=q_z2,
-                        num_samples=args.intrinsic_num_samples,
-                    )
-
-                    if args.intrinsic_use_running_scale:
-                        baseline = dH_baseline.update(raw_bonus)
-                        bonus_scaled, intrinsic_stats = scale_intrinsic_reward(
-                            raw_bonus,
-                            rewards,
-                            baseline=baseline,
-                            target_ratio=args.intrinsic_target_ratio,
-                            clip_value=args.intrinsic_clip_value,
-                        )
-                        intrinsic_bonus = bonus_scaled
-                    else:
-                        bonus_centered = raw_bonus - raw_bonus.mean()
-                        bonus_clipped = torch.clamp(bonus_centered, -args.intrinsic_clip_value, args.intrinsic_clip_value)
-                        intrinsic_bonus = args.intrinsic_beta * bonus_clipped
-
-                if intrinsic_bonus is not None:
-                    rewards_total = rewards.clone()
-                    rewards_total[:, 1:] = rewards_total[:, 1:] + intrinsic_bonus
-                else:
                     rewards_total = rewards
-
-                if args.diag_use and (global_step % args.diag_every == 0):
-                    if raw_bonus is not None:
-                        bonus_band_stats_raw = compute_band_bonus_diagnostics(
-                            raw_bonus=raw_bonus,
-                            images=images,
-                            world_radius=world_radius,
-                            band_center_x=args.band_center_x,
-                            band_width=args.band_width,
-                        )
-                    if intrinsic_bonus is not None:
-                        bonus_band_stats_scaled = compute_band_bonus_diagnostics(
-                            raw_bonus=intrinsic_bonus,
-                            images=images,
-                            world_radius=world_radius,
-                            band_center_x=args.band_center_x,
-                            band_width=args.band_width,
-                        )
-            
-            #print("intrinsic_stats", intrinsic_stats)
-            #print("intrinsic_bonus", intrinsic_bonus)
 
             q_loss, q_pred, target_q = agent.compute_loss(z1, z2, actions, rewards_total, dones)
 
@@ -2130,8 +1310,7 @@ if __name__ == '__main__':
                 writer.add_scalar("train/rewards_mean", rewards.mean().item(), global_step)
                 writer.add_scalar("train/world_model_loss", model_loss.item(), global_step)
 
-                """#if args.mi_use and args.mi_beta > 0.0:
-                if args.mi_use:
+                if args.mi_use and args.mi_beta > 0.0:
                     writer.add_scalar("train/mi_raw_mean", mi_raw_mean, global_step)
                     writer.add_scalar("train/mi_raw_std", mi_raw_std, global_step)
                     writer.add_scalar("train/mi_shaped_mean", mi_shaped_mean, global_step)
@@ -2145,96 +1324,7 @@ if __name__ == '__main__':
                     writer.add_scalar("train/mi_clip_mean", mi_clip.mean().item(), global_step)
                     writer.add_scalar("train/mi_clip_max", mi_clip.max().item(), global_step)
                     writer.add_scalar("train/mi_clip_min", mi_clip.min().item(), global_step)
-                    writer.add_scalar("train/mi_to_env_abs_ratio", mi_to_env_ratio.item(), global_step)"""
-                if intrinsic_stats is not None:
-                    writer.add_scalar("intrinsic/raw_mean", intrinsic_stats["raw_mean"].item(), global_step)
-                    writer.add_scalar("intrinsic/raw_std", intrinsic_stats["raw_std"].item(), global_step)
-                    writer.add_scalar("intrinsic/baseline", intrinsic_stats["baseline"].item(), global_step)
-                    writer.add_scalar("intrinsic/scaled_mean", intrinsic_stats["scaled_mean"].item(), global_step)
-                    writer.add_scalar("intrinsic/scaled_std", intrinsic_stats["scaled_std"].item(), global_step)
-                    writer.add_scalar("intrinsic/scaled_abs_mean", intrinsic_stats["scaled_abs_mean"].item(), global_step)
-                    writer.add_scalar("intrinsic/scaled_max_abs", intrinsic_stats["scaled_max_abs"].item(), global_step)
-                    writer.add_scalar("intrinsic/auto_beta", intrinsic_stats["auto_beta"].item(), global_step)
-                
-                if intrinsic_stats is not None:
-                    env_reward_abs_mean = rewards[:, 1:].abs().mean()
-                    ratio = intrinsic_stats["scaled_abs_mean"] / (env_reward_abs_mean + 1e-8)
-                    writer.add_scalar("intrinsic/to_env_abs_ratio", ratio.item(), global_step)
-                
-                if diag_stats is not None:
-                    writer.add_scalar("diag/post_z1_std_mean", diag_stats["post_z1_std_mean"].item(), global_step)
-                    writer.add_scalar("diag/post_z2_std_mean", diag_stats["post_z2_std_mean"].item(), global_step)
-                    writer.add_scalar("diag/post_z1_var_mean", diag_stats["post_z1_var_mean"].item(), global_step)
-                    writer.add_scalar("diag/post_z2_var_mean", diag_stats["post_z2_var_mean"].item(), global_step)
-
-                    writer.add_scalar("diag/latent_pairwise_dist_mean", diag_stats["latent_pairwise_dist_mean"].item(), global_step)
-
-                    writer.add_scalar("diag/q_taken_std_mean", diag_stats["q_taken_std_mean"].item(), global_step)
-                    writer.add_scalar("diag/probs_std_mean", diag_stats["probs_std_mean"].item(), global_step)
-                    writer.add_scalar("diag/logits_std_mean", diag_stats["logits_std_mean"].item(), global_step)
-                
-                if band_entropy_stats is not None:
-                    writer.add_scalar("diag_entropy/H_mean", band_entropy_stats["H_mean"].item(), global_step)
-                    writer.add_scalar("diag_entropy/dH_mean", band_entropy_stats["dH_mean"].item(), global_step)
-
-                    if not torch.isnan(band_entropy_stats["dH_out_out"]):
-                        writer.add_scalar("diag_entropy/dH_out_out", band_entropy_stats["dH_out_out"].item(), global_step)
-                    if not torch.isnan(band_entropy_stats["dH_out_in"]):
-                        writer.add_scalar("diag_entropy/dH_out_in", band_entropy_stats["dH_out_in"].item(), global_step)
-                    if not torch.isnan(band_entropy_stats["dH_in_in"]):
-                        writer.add_scalar("diag_entropy/dH_in_in", band_entropy_stats["dH_in_in"].item(), global_step)
-                    if not torch.isnan(band_entropy_stats["dH_in_out"]):
-                        writer.add_scalar("diag_entropy/dH_in_out", band_entropy_stats["dH_in_out"].item(), global_step)
-
-                    writer.add_scalar("diag_entropy/frac_out_out", band_entropy_stats["frac_out_out"].item(), global_step)
-                    writer.add_scalar("diag_entropy/frac_out_in", band_entropy_stats["frac_out_in"].item(), global_step)
-                    writer.add_scalar("diag_entropy/frac_in_in", band_entropy_stats["frac_in_in"].item(), global_step)
-                    writer.add_scalar("diag_entropy/frac_in_out", band_entropy_stats["frac_in_out"].item(), global_step)
-                
-                if bonus_band_stats_raw is not None:
-                    writer.add_scalar("diag_bonus_raw/mean", bonus_band_stats_raw["bonus_mean"].item(), global_step)
-                    writer.add_scalar("diag_bonus_raw/abs_mean", bonus_band_stats_raw["bonus_abs_mean"].item(), global_step)
-
-                    if not torch.isnan(bonus_band_stats_raw["bonus_out_out"]):
-                        writer.add_scalar("diag_bonus_raw/out_out", bonus_band_stats_raw["bonus_out_out"].item(), global_step)
-                    if not torch.isnan(bonus_band_stats_raw["bonus_out_in"]):
-                        writer.add_scalar("diag_bonus_raw/out_in", bonus_band_stats_raw["bonus_out_in"].item(), global_step)
-                    if not torch.isnan(bonus_band_stats_raw["bonus_in_in"]):
-                        writer.add_scalar("diag_bonus_raw/in_in", bonus_band_stats_raw["bonus_in_in"].item(), global_step)
-                    if not torch.isnan(bonus_band_stats_raw["bonus_in_out"]):
-                        writer.add_scalar("diag_bonus_raw/in_out", bonus_band_stats_raw["bonus_in_out"].item(), global_step)
-
-                if bonus_band_stats_scaled is not None:
-                    writer.add_scalar("diag_bonus_scaled/mean", bonus_band_stats_scaled["bonus_mean"].item(), global_step)
-                    writer.add_scalar("diag_bonus_scaled/abs_mean", bonus_band_stats_scaled["bonus_abs_mean"].item(), global_step)
-
-                    if not torch.isnan(bonus_band_stats_scaled["bonus_out_out"]):
-                        writer.add_scalar("diag_bonus_scaled/out_out", bonus_band_stats_scaled["bonus_out_out"].item(), global_step)
-                    if not torch.isnan(bonus_band_stats_scaled["bonus_out_in"]):
-                        writer.add_scalar("diag_bonus_scaled/out_in", bonus_band_stats_scaled["bonus_out_in"].item(), global_step)
-                    if not torch.isnan(bonus_band_stats_scaled["bonus_in_in"]):
-                        writer.add_scalar("diag_bonus_scaled/in_in", bonus_band_stats_scaled["bonus_in_in"].item(), global_step)
-                    if not torch.isnan(bonus_band_stats_scaled["bonus_in_out"]):
-                        writer.add_scalar("diag_bonus_scaled/in_out", bonus_band_stats_scaled["bonus_in_out"].item(), global_step)
-                                
-                if rel_diag_stats is not None:
-                    writer.add_scalar("diag_rel/post_z1_std_over_mean_abs", rel_diag_stats["rel_post_z1_std"].item(), global_step)
-                    writer.add_scalar("diag_rel/post_z2_std_over_mean_abs", rel_diag_stats["rel_post_z2_std"].item(), global_step)
-                    writer.add_scalar("diag_rel/latent_pairwise_dist_over_latent_norm", rel_diag_stats["rel_latent_pairwise_dist"].item(), global_step)
-                    writer.add_scalar("diag_rel/q_taken_std_over_q_taken_abs_mean", rel_diag_stats["rel_q_taken_std"].item(), global_step)
-                    writer.add_scalar("diag_rel/q_taken_abs_mean", rel_diag_stats["q_taken_abs_mean"].item(), global_step)
-                
-                if all_action_diag_stats is not None:
-                    writer.add_scalar("diag_all_actions/q_all_actions_std_mean", all_action_diag_stats["q_all_actions_std_mean"].item(), global_step)
-                    writer.add_scalar("diag_all_actions/q_max_action_std_mean", all_action_diag_stats["q_max_action_std_mean"].item(), global_step)
-
-                    writer.add_scalar("diag_all_actions/rel_q_all_actions_std_mean", all_action_diag_stats["rel_q_all_actions_std_mean"].item(), global_step)
-                    writer.add_scalar("diag_all_actions/rel_q_max_action_std_mean", all_action_diag_stats["rel_q_max_action_std_mean"].item(), global_step)
-
-                    writer.add_scalar("diag_all_actions/best_q_std_mean", all_action_diag_stats["best_q_std_mean"].item(), global_step)
-                    writer.add_scalar("diag_all_actions/rel_best_q_std_mean", all_action_diag_stats["rel_best_q_std_mean"].item(), global_step)
-
-                    writer.add_scalar("diag_all_actions/argmax_disagreement_mean", all_action_diag_stats["argmax_disagreement_mean"].item(), global_step)
+                    writer.add_scalar("train/mi_to_env_abs_ratio", mi_to_env_ratio.item(), global_step)
 
     
     if writer is not None:
