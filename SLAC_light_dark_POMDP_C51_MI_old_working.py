@@ -82,7 +82,7 @@ class Args:
     """the frequency of training"""
     target_network_frequency: int = 1000
     """the frequency of target network update"""
-    world_model_update_frequency: int = 16
+    world_model_update_frequency: int = 32
     """the frequency of world model update (in gradient steps, not env steps)"""
     tau: float = 0.005
     """the polyak averaging factor for target network update"""
@@ -131,7 +131,7 @@ class Args:
     # Logging
     track: bool = True
     """If toggled, logs metrics & videos to Weights & Biases."""
-    wandb_project_name: str = "light-dark-slac_POMDP_fixedtarget_nocue"
+    wandb_project_name: str = "light-dark-slac_POMDP"
     """W&B project name"""
     wandb_entity: str | None = None
     """W&B entity (team/user). None = default."""
@@ -989,7 +989,7 @@ if __name__ == '__main__':
         sigma_light=0.05,
         # obs composition
         include_goal_in_obs=True,
-        noisy_goal_obs=False,
+        noisy_goal_obs=True,
         # episode randomization
         randomize_start=True,
         randomize_goal=True,

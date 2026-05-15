@@ -432,7 +432,7 @@ class LightDarkNavigationEnv(Env):
         if self.cfg.include_goal_in_obs:
             g = np.array(self.cfg.goal, dtype=np.float32)
             if self.cfg.noisy_goal_obs:
-                sigma_g = self._sigma_at(g)
+                sigma_g = self._sigma_at(x)
                 g = (g + self.rng.normal(0.0, sigma_g, size=(2,))).astype(np.float32)
             parts.append(g.astype(np.float32))
         return np.concatenate(parts).astype(np.float32)
