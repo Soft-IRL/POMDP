@@ -1,0 +1,208 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\title{World-Model KL Surprise vs.\ C51 Mutual Information\\
+\large Two intrinsic signals for the Light-Dark POMDP}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\paragraph{Sign convention.}
+WM-KL is \emph{high} inside the band, not low. In the band, the precise
+observation makes the posterior $q(z_{t+1}\mid x_{t+1}, z_t, a_t)$ sharpen
+far from the broader prior $p(z_{t+1}\mid z_t, a_t)$, so the KL is large. In
+the dark, the observation is too noisy to update the prior much, so the KL is
+small. Both WM-KL and C51-MI therefore point the agent toward the band; they
+just do so through different mechanisms.
+
+\paragraph{One-line framing.}
+\begin{itemize}
+  \item \textbf{WM-KL:} ``I learned something about the world.''
+  \item \textbf{C51-MI:} ``I learned something that matters for the task.''
+\end{itemize}
+
+\section{What each signal measures}
+
+\subsection*{WM-KL --- state-representation level}
+\[
+  r_{\mathrm{WM\text{-}KL}}(t{+}1)
+  \;=\;
+  \mathrm{KL}\!\left(
+    q(z_{t+1}\mid x_{t+1}, z_t, a_t)
+    \;\big\|\;
+    p(z_{t+1}\mid z_t, a_t)
+  \right).
+\]
+This is the information a single observation provided about where the agent
+is, regardless of what that location means for the task. It is:
+\begin{itemize}
+  \item per-step (a snapshot, not a difference);
+  \item task-agnostic --- the reward function never enters the formula;
+  \item driven by \emph{observation noise structure} (low $\sigma$ $\Rightarrow$ large KL; high $\sigma$ $\Rightarrow$ small KL);
+  \item about the \emph{world model's} own uncertainty over the next latent.
+\end{itemize}
+
+\subsection*{C51-MI --- return-distribution level}
+\[
+  r_{\mathrm{info}}(t)
+  \;=\;
+  \mathrm{MI}(t) - \mathrm{MI}(t{+}1),
+  \qquad
+  \mathrm{MI}(t) \;=\; I\!\left(Z;\, R \mid a\right)
+  \;=\;
+  H\!\left[\bar{p}(R\mid a)\right]
+  - \mathbb{E}_z\!\left[ H\!\left[p(R\mid z, a)\right] \right].
+\]
+This measures how much, in expectation, knowing the latent reduces
+uncertainty about future return under the current belief. It is:
+\begin{itemize}
+  \item a temporal difference (sharpening over a step);
+  \item task-conditional --- the return distribution is shaped by reward and~$\gamma$;
+  \item driven by how disambiguating different latents are for outcomes;
+  \item about the agent's \emph{predictive uncertainty over consequences}.
+\end{itemize}
+
+\section{The conceptual axis}
+
+Consider four kinds of transitions:
+
+\begin{center}
+\begin{tabular}{clccc}
+\toprule
+ & Description & Observation informative? & Matters for return? \\
+\midrule
+A & Band entry in Light-Dark        & yes & yes \\
+B & Informative but task-irrelevant feature & yes & no  \\
+C & State-level redundant but task-relevant disambiguation & no  & yes \\
+D & Empty rollout, deep in the dark & no  & no  \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{ccc}
+\toprule
+Case & WM-KL & $r_{\mathrm{info}}$ \\
+\midrule
+A & high & high \\
+B & high & $\approx 0$ \\
+C & $\approx 0$ & high (if belief was wrong) \\
+D & $\approx 0$ & $\approx 0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+In Light-Dark, cases A and D dominate, so the two signals are largely
+aligned. The philosophical difference, however, persists:
+
+\begin{itemize}
+  \item \textbf{WM-KL} says: \emph{``seek observation-rich states.''} The
+    agent learns the structure of the world, full stop.
+  \item \textbf{C51-MI} says: \emph{``seek states whose disambiguation
+    tightens your prediction of return.''} The agent learns the structure
+    of \emph{the task as it applies to its current belief}.
+\end{itemize}
+
+\section{Why C51-MI is, in principle, the more refined signal}
+
+C51-MI carries information that WM-KL discards:
+
+\begin{enumerate}
+  \item \textbf{Task gating.} WM-KL fires wherever observations are
+    informative. In a multi-room maze with cameras on every wall, WM-KL
+    would happily reward staring at wall textures. C51-MI fires only when
+    disambiguation actually changes the return prediction.
+  \item \textbf{Reducibility (noisy-TV problem).} WM-KL does not know which
+    uncertainty is reducible by agent action. A noisy but uncontrollable
+    observation channel will keep producing high WM-KL forever. C51-MI is
+    grounded in the return distribution, which only sharpens when the
+    agent's value estimate tightens---a much more action-controllable
+    quantity.
+  \item \textbf{Belief-conditional priority.} WM-KL is independent of what
+    the agent currently believes. C51-MI uses the actual belief at time~$t$.
+    If the agent already knows where it is in the band, both $\mathrm{MI}(t)$
+    and $\mathrm{MI}(t{+}1)$ are small and $r_{\mathrm{info}} \approx 0$;
+    redundant band visits are not paid for. WM-KL would still pay.
+\end{enumerate}
+
+\noindent
+In short: \textbf{C51-MI is WM-KL filtered through ``and this matters for
+what I'm trying to do.''}
+
+\section{Why WM-KL is, in practice, the more usable signal}
+
+The flip side is bootstrapping. The refinement of C51-MI comes from passing
+through the return distribution $p(R\mid z, a)$, which is only meaningful
+once the C51 head is trained. Early in training:
+\begin{itemize}
+  \item The C51 head is near-uniform $\Rightarrow$ $I(Z;R)$ is whatever
+    noise the head outputs $\Rightarrow$ $r_{\mathrm{info}}$ is noise.
+  \item WM-KL only requires the world-model encoder/decoder/prior to be
+    plausible, which holds after a few thousand world-model gradient steps,
+    independent of the critic.
+\end{itemize}
+Thus WM-KL is \textbf{available earlier}, while C51-MI is \textbf{better-shaped later}.
+
+\section{Complementarity}
+
+The two signals form a natural two-phase decomposition of exploration:
+
+\begin{itemize}
+  \item \textbf{WM-KL is the natural curriculum for the encoder.} Driving
+    the agent to observation-rich states gives the world model the data
+    it needs to become accurate. It is a bootstrapping signal: it improves
+    the substrate every other component---including C51---relies on.
+  \item \textbf{C51-MI is the natural objective for the policy.} Once the
+    world model is good enough that beliefs are meaningful, C51-MI says
+    ``go to states whose disambiguation will tighten your value estimate.''
+    It directly aligns belief reduction with task progress.
+\end{itemize}
+
+Sequenced informally:
+\[
+  \text{Phase 1: WM-KL dominates} \;\longrightarrow\; \text{agent learns the world's observation structure.}
+\]
+\[
+  \text{Phase 2: C51-MI dominates} \;\longrightarrow\; \text{agent learns which parts of that structure matter.}
+\]
+
+This mirrors the strategy of methods like Plan2Explore (disagreement-based,
+encoder-driven) followed by task-aware refinement once reward starts flowing.
+
+\section{Concrete proposal}
+
+Combine the two as a weighted shaping term:
+\[
+  r_{\mathrm{total}}(t)
+  \;=\;
+  r_{\mathrm{env}}(t)
+  \;+\;
+  \beta_{\mathrm{KL}}(t)\cdot r_{\mathrm{WM\text{-}KL}}(t)
+  \;+\;
+  \beta_{\mathrm{MI}}(t)\cdot r_{\mathrm{info}}(t),
+\]
+with $\beta_{\mathrm{KL}}(t)$ annealed downward and $\beta_{\mathrm{MI}}(t)$
+annealed upward over training. The existing z-score normalization and
+adaptive-$\beta$ controller can be reused unchanged for both terms.
+
+\paragraph{Recommended first experiment.}
+Try WM-KL alone first. The current C51-MI runs show the C51 head's
+belief-entropy proxy is not yet a reliable signal source---it actively hurts
+$\mathrm{success\_reach}$ at active magnitudes. WM-KL would test whether
+exploration shaping helps \emph{at all}, using a signal that does not
+depend on the critic being calibrated.
+\begin{itemize}
+  \item If WM-KL alone moves $\mathrm{success\_reach}$ meaningfully, the
+    bottleneck is exploration; C51-MI can be layered back on later.
+  \item If WM-KL also does not move it, the bottleneck is value
+    propagation rather than exploration, and the right next steps are
+    $n$-step returns, a separate intrinsic value head, or simply longer
+    training.
+\end{itemize}
+
+\end{document}

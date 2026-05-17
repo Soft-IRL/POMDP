@@ -112,7 +112,7 @@ class Args:
     """Maximum value of the support for C51."""
 
     # ========= Mutual-information intrinsic bonus =========
-    mi_use: bool = False
+    mi_use: bool = True
     """If toggled, adds MI-based intrinsic reward."""
     mi_num_samples: int = 4
     """Posterior samples per timestep for MI estimation."""
@@ -121,30 +121,11 @@ class Args:
     mi_norm_eps: float = 1e-8
     """epsilon for MI normalization"""
 
-    mi_clip_value: float = 3.0
-    """clip value for normalized MI bonus (in std units after z-score normalization)"""
+    mi_clip_value: float = 2.0
+    """clip value for normalized MI bonus"""
 
     mi_center: bool = True
     """whether to subtract batch mean from MI bonus before scaling"""
-
-    # --- Adaptive mi_beta (reward-magnitude matching + z-score normalization) ---
-    mi_adaptive_beta: bool = True
-    """If True, mi_beta is recomputed online so that the shaped intrinsic reward
-    matches a target fraction of the env-reward magnitude (Burda-RND style)."""
-    mi_target_ratio: float = 0.05
-    """Initial target value of E[|beta * info_norm|] / E[|r_env|]."""
-    mi_target_ratio_final: float = 0.01
-    """Final target ratio (annealed from mi_target_ratio over mi_target_ratio_anneal_steps)."""
-    mi_target_ratio_anneal_steps: int = 200_000
-    """Linear anneal length for the target ratio."""
-    mi_ema_decay: float = 0.99
-    """Decay for EMA of running stats (info_gain std, |env reward|, |info_norm|)."""
-    mi_beta_update_every: int = 1000
-    """How often (in global steps) to refresh mi_beta from EMAs."""
-    mi_beta_min: float = 1e-4
-    """Floor for adaptive mi_beta."""
-    mi_beta_max: float = 1e3
-    """Ceiling for adaptive mi_beta."""
 
 
     # Logging
@@ -1088,13 +1069,6 @@ if __name__ == '__main__':
         z1_bel = Model.latent1_first_posterior(feat0).rsample() # (N, d1)
         z2_bel = Model.latent2_first_posterior(z1_bel).rsample()# (N, d2)
 
-    # ---- Adaptive mi_beta state (Burda-RND-style normalization + reward-magnitude matching) ----
-    info_std_ema = None        # EMA of std(info_gain_raw)
-    env_abs_ema = None         # EMA of mean(|r_env|)
-    info_norm_abs_ema = None   # EMA of mean(|info_norm_clipped|)
-    mi_beta_dynamic = float(args.mi_beta)  # current effective beta
-    current_target_ratio = float(args.mi_target_ratio)
-
     for global_step in tqdm(range(args.total_timesteps+1)):
         agent.epsilon = agent.linear_schedule(args.start_e, args.end_e, int(args.exploration_fraction * args.total_timesteps), global_step)
 
@@ -1202,46 +1176,9 @@ if __name__ == '__main__':
 
                     info_gain = mi_full[:, :-1] - mi_full[:, 1:]   # (B, S-1)
 
-                    # --- Z-score normalization with running std (Burda et al., RND) ---
-                    info_batch_mean = info_gain.mean()
-                    info_batch_std = info_gain.std(unbiased=False)
-                    env_batch_abs = rewards[:, 1:].abs().mean()
-
-                    decay = args.mi_ema_decay
-                    if info_std_ema is None:
-                        info_std_ema = float(info_batch_std.item())
-                        env_abs_ema = float(env_batch_abs.item())
-                    else:
-                        info_std_ema = decay * info_std_ema + (1.0 - decay) * float(info_batch_std.item())
-                        env_abs_ema = decay * env_abs_ema + (1.0 - decay) * float(env_batch_abs.item())
-
-                    info_centered = info_gain - info_batch_mean if args.mi_center else info_gain
-                    info_norm = info_centered / (info_std_ema + args.mi_norm_eps)
-                    info_clip = torch.clamp(info_norm, -args.mi_clip_value, args.mi_clip_value)
-
-                    info_norm_abs_batch = info_clip.abs().mean()
-                    if info_norm_abs_ema is None:
-                        info_norm_abs_ema = float(info_norm_abs_batch.item())
-                    else:
-                        info_norm_abs_ema = decay * info_norm_abs_ema + (1.0 - decay) * float(info_norm_abs_batch.item())
-
-                    # --- Adaptive beta: match a target fraction of env-reward magnitude ---
-                    if args.mi_adaptive_beta and (global_step % args.mi_beta_update_every == 0):
-                        progress = min(1.0, global_step / max(1, args.mi_target_ratio_anneal_steps))
-                        current_target_ratio = (
-                            args.mi_target_ratio
-                            + (args.mi_target_ratio_final - args.mi_target_ratio) * progress
-                        )
-                        target_beta = (
-                            current_target_ratio * env_abs_ema
-                            / (info_norm_abs_ema + args.mi_norm_eps)
-                        )
-                        mi_beta_dynamic = float(
-                            min(max(target_beta, args.mi_beta_min), args.mi_beta_max)
-                        )
-
-                    beta_eff = mi_beta_dynamic if args.mi_adaptive_beta else float(args.mi_beta)
-                    info_shaped = beta_eff * info_clip
+                    info_centered = info_gain - info_gain.mean()
+                    info_clip = torch.clamp(info_centered, -args.mi_clip_value, args.mi_clip_value)
+                    info_shaped = args.mi_beta * info_clip
 
                     rewards_total = rewards.clone()
                     rewards_total[:, 1:] = rewards_total[:, 1:] + info_shaped
@@ -1351,11 +1288,6 @@ if __name__ == '__main__':
                     writer.add_scalar("train/info_gain_clip_max", info_clip.max().item(), global_step)
                     writer.add_scalar("train/info_gain_clip_min", info_clip.min().item(), global_step)
                     writer.add_scalar("train/info_gain_to_env_abs_ratio", info_to_env_ratio.item(), global_step)
-                    writer.add_scalar("train/mi_beta_effective", float(beta_eff), global_step)
-                    writer.add_scalar("train/mi_target_ratio", float(current_target_ratio), global_step)
-                    writer.add_scalar("train/info_std_ema", float(info_std_ema), global_step)
-                    writer.add_scalar("train/env_abs_ema", float(env_abs_ema), global_step)
-                    writer.add_scalar("train/info_norm_abs_ema", float(info_norm_abs_ema), global_step)
 
     
     if writer is not None:

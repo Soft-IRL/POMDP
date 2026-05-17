@@ -146,6 +146,39 @@ class Args:
     mi_beta_max: float = 1e3
     """Ceiling for adaptive mi_beta."""
 
+    # ========= World-Model KL intrinsic bonus =========
+    kl_use: bool = True
+    """If toggled, adds WM-KL based intrinsic reward (mutually exclusive in spirit with mi_use)."""
+    kl_beta: float = 0.1
+    """Initial weight of WM-KL bonus added to env reward at r_{t+1}."""
+    kl_norm_eps: float = 1e-8
+    """epsilon for KL normalization."""
+    kl_clip_value: float = 3.0
+    """clip value for normalized WM-KL bonus (in std units after z-score normalization)."""
+    kl_center: bool = True
+    """whether to subtract batch mean from WM-KL bonus before scaling."""
+    kl_use_z2: bool = False
+    """If True, also include z2 KL in the WM-KL bonus (default: z1 only, matching the WM loss)."""
+
+    # --- Adaptive kl_beta (reward-magnitude matching + z-score normalization) ---
+    kl_adaptive_beta: bool = True
+    """If True, kl_beta is recomputed online so the shaped intrinsic reward
+    matches a target fraction of the env-reward magnitude (Burda-RND style)."""
+    kl_target_ratio: float = 0.05
+    """Initial target value of E[|beta * kl_norm|] / E[|r_env|]."""
+    kl_target_ratio_final: float = 0.01
+    """Final target ratio (annealed from kl_target_ratio over kl_target_ratio_anneal_steps)."""
+    kl_target_ratio_anneal_steps: int = 200_000
+    """Linear anneal length for the target ratio."""
+    kl_ema_decay: float = 0.99
+    """Decay for EMA of running stats (KL std, |env reward|, |kl_norm|)."""
+    kl_beta_update_every: int = 1000
+    """How often (in global steps) to refresh kl_beta from EMAs."""
+    kl_beta_min: float = 1e-4
+    """Floor for adaptive kl_beta."""
+    kl_beta_max: float = 1e3
+    """Ceiling for adaptive kl_beta."""
+
 
     # Logging
     track: bool = True
@@ -1095,6 +1128,13 @@ if __name__ == '__main__':
     mi_beta_dynamic = float(args.mi_beta)  # current effective beta
     current_target_ratio = float(args.mi_target_ratio)
 
+    # ---- Adaptive kl_beta state (same scaffold, separate EMAs) ----
+    kl_std_ema = None
+    kl_env_abs_ema = None
+    kl_norm_abs_ema = None
+    kl_beta_dynamic = float(args.kl_beta)
+    kl_current_target_ratio = float(args.kl_target_ratio)
+
     for global_step in tqdm(range(args.total_timesteps+1)):
         agent.epsilon = agent.linear_schedule(args.start_e, args.end_e, int(args.exploration_fraction * args.total_timesteps), global_step)
 
@@ -1263,6 +1303,85 @@ if __name__ == '__main__':
                     env_reward_max_abs = rewards[:, 1:].abs().max()
                     info_to_env_ratio = info_shaped_abs_mean / (env_reward_abs_mean + 1e-8)
 
+                elif args.kl_use and args.kl_beta > 0.0:
+                    # ----- WM-KL bonus -----
+                    # r_surprise(t+1) = KL( q(z_{t+1} | x_{t+1}, z_t, a_t) || p(z_{t+1} | z_t, a_t) )
+                    # Per-step posterior-vs-prior divergence at the latent level.
+                    # Large in the band (precise obs sharpens posterior far from prior),
+                    # small in the dark (noisy obs keeps posterior ~ prior).
+                    p_z1, p_z2, _, _ = Model.get_prior(z1, z2, actions, step_ty)
+                    q1 = q_z1.dists.base_dist
+                    p1 = p_z1.dists.base_dist
+                    kl_full = torch.distributions.kl_divergence(q1, p1).sum(-1)  # (B, T+1)
+                    if args.kl_use_z2:
+                        q2 = q_z2.dists.base_dist
+                        p2 = p_z2.dists.base_dist
+                        kl_full = kl_full + torch.distributions.kl_divergence(q2, p2).sum(-1)
+
+                    # Bonus at step t+1 uses KL at index t+1 (no temporal differencing —
+                    # WM-KL is itself a per-step surprise value, not an entropy to differentiate).
+                    info_gain = kl_full[:, 1:]   # (B, T)  attached to rewards[:, 1:]
+
+                    info_batch_mean = info_gain.mean()
+                    info_batch_std = info_gain.std(unbiased=False)
+                    env_batch_abs = rewards[:, 1:].abs().mean()
+
+                    decay = args.kl_ema_decay
+                    if kl_std_ema is None:
+                        kl_std_ema = float(info_batch_std.item())
+                        kl_env_abs_ema = float(env_batch_abs.item())
+                    else:
+                        kl_std_ema = decay * kl_std_ema + (1.0 - decay) * float(info_batch_std.item())
+                        kl_env_abs_ema = decay * kl_env_abs_ema + (1.0 - decay) * float(env_batch_abs.item())
+
+                    info_centered = info_gain - info_batch_mean if args.kl_center else info_gain
+                    info_norm = info_centered / (kl_std_ema + args.kl_norm_eps)
+                    info_clip = torch.clamp(info_norm, -args.kl_clip_value, args.kl_clip_value)
+
+                    kl_norm_abs_batch = info_clip.abs().mean()
+                    if kl_norm_abs_ema is None:
+                        kl_norm_abs_ema = float(kl_norm_abs_batch.item())
+                    else:
+                        kl_norm_abs_ema = decay * kl_norm_abs_ema + (1.0 - decay) * float(kl_norm_abs_batch.item())
+
+                    if args.kl_adaptive_beta and (global_step % args.kl_beta_update_every == 0):
+                        progress = min(1.0, global_step / max(1, args.kl_target_ratio_anneal_steps))
+                        kl_current_target_ratio = (
+                            args.kl_target_ratio
+                            + (args.kl_target_ratio_final - args.kl_target_ratio) * progress
+                        )
+                        target_beta = (
+                            kl_current_target_ratio * kl_env_abs_ema
+                            / (kl_norm_abs_ema + args.kl_norm_eps)
+                        )
+                        kl_beta_dynamic = float(
+                            min(max(target_beta, args.kl_beta_min), args.kl_beta_max)
+                        )
+
+                    beta_eff = kl_beta_dynamic if args.kl_adaptive_beta else float(args.kl_beta)
+                    info_shaped = beta_eff * info_clip
+
+                    rewards_total = rewards.clone()
+                    rewards_total[:, 1:] = rewards_total[:, 1:] + info_shaped
+
+                    # Metrics
+                    kl_raw_mean = kl_full.mean()
+                    kl_raw_std = kl_full.std(unbiased=False)
+                    kl_raw_max = kl_full.max()
+
+                    info_raw_mean = info_gain.mean()
+                    info_raw_std = info_gain.std(unbiased=False)
+                    info_shaped_mean = info_shaped.mean()
+                    info_shaped_std = info_shaped.std(unbiased=False)
+                    info_shaped_abs_mean = info_shaped.abs().mean()
+                    info_shaped_max_abs = info_shaped.abs().max()
+
+                    env_reward_mean = rewards[:, 1:].mean()
+                    env_reward_std = rewards[:, 1:].std(unbiased=False)
+                    env_reward_abs_mean = rewards[:, 1:].abs().mean()
+                    env_reward_max_abs = rewards[:, 1:].abs().max()
+                    info_to_env_ratio = info_shaped_abs_mean / (env_reward_abs_mean + 1e-8)
+
                 else:
                     rewards_total = rewards
 
@@ -1357,7 +1476,27 @@ if __name__ == '__main__':
                     writer.add_scalar("train/env_abs_ema", float(env_abs_ema), global_step)
                     writer.add_scalar("train/info_norm_abs_ema", float(info_norm_abs_ema), global_step)
 
-    
+                if args.kl_use and args.kl_beta > 0.0:
+                    writer.add_scalar("train/kl_raw_mean", kl_raw_mean, global_step)
+                    writer.add_scalar("train/kl_raw_std", kl_raw_std, global_step)
+                    writer.add_scalar("train/kl_raw_max", kl_raw_max, global_step)
+                    writer.add_scalar("train/kl_shaped_mean", info_shaped_mean, global_step)
+                    writer.add_scalar("train/kl_shaped_std", info_shaped_std, global_step)
+                    writer.add_scalar("train/kl_shaped_abs_mean", info_shaped_abs_mean, global_step)
+                    writer.add_scalar("train/kl_shaped_max_abs", info_shaped_max_abs, global_step)
+                    writer.add_scalar("train/kl_clip_mean", info_clip.mean().item(), global_step)
+                    writer.add_scalar("train/kl_clip_max", info_clip.max().item(), global_step)
+                    writer.add_scalar("train/kl_clip_min", info_clip.min().item(), global_step)
+                    writer.add_scalar("train/kl_to_env_abs_ratio", info_to_env_ratio.item(), global_step)
+                    writer.add_scalar("train/kl_beta_effective", float(beta_eff), global_step)
+                    writer.add_scalar("train/kl_target_ratio", float(kl_current_target_ratio), global_step)
+                    writer.add_scalar("train/kl_std_ema", float(kl_std_ema), global_step)
+                    writer.add_scalar("train/kl_env_abs_ema", float(kl_env_abs_ema), global_step)
+                    writer.add_scalar("train/kl_norm_abs_ema", float(kl_norm_abs_ema), global_step)
+                    writer.add_scalar("train/env_reward_mean", env_reward_mean, global_step)
+                    writer.add_scalar("train/env_reward_abs_mean", env_reward_abs_mean, global_step)
+
+
     if writer is not None:
         writer.close()
     if run is not None:
